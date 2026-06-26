@@ -1,0 +1,3 @@
+# Generated bundle target. The self-contained Python preview env (pyenv/, GMR/,
+# assets/, meshcat_preview/) is created here by tools/meshcat_preview/build_bundle.sh
+# and bundled into the app at `tauri build`. Contents are git-ignored.

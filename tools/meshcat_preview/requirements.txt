@@ -1,0 +1,16 @@
+# Deps for the Meshcat motion-preview backend.
+#
+# Rendering reuses GMR's MuJoCo model directly (no pinocchio, no separate URDF).
+# GMR itself is used from its source checkout (SCL_GMR_ROOT) — these are its
+# runtime deps for retargeting + our web viewer:
+#
+#   pip install -r requirements.txt
+#
+numpy
+scipy
+mujoco
+mink
+rich
+imageio
+loop-rate-limiters
+meshcat

@@ -9,10 +9,22 @@
   import { library } from "$lib/services/motions.svelte";
   import { ROBOT_TYPES } from "$lib/services/robotTypes";
   import type { RobotType } from "$lib/services/types";
+  import { isTauri, pickMotionFile } from "$lib/services/tauri";
 
   let motionInput: HTMLInputElement;
   let policyInput: HTMLInputElement;
   let pendingPolicyFile = $state<File | null>(null);
+
+  // In the desktop app: native dialog → absolute path → auto-spawned Meshcat
+  // preview. In the browser: fall back to the HTML file input (mock preview).
+  async function importMotion() {
+    if (isTauri()) {
+      const path = await pickMotionFile();
+      if (path) await library.importMotionFromPath(path);
+    } else {
+      motionInput?.click();
+    }
+  }
 
   async function onPickMotion(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
@@ -71,15 +83,22 @@
   </PageHeader>
 
   <div class="meta-row">
-    <span class="chip mono"><Icon name="file" size={13} /> {mtn.frames} frames</span>
-    <span class="chip mono">{fmtTime(mtn.durationSec)} @ {mtn.fps}fps</span>
-    <span class="chip mono">{mtn.columns} DoF</span>
+    {#if mtn.frames > 0}
+      <span class="chip mono"><Icon name="file" size={13} /> {mtn.frames} frames</span>
+      <span class="chip mono">{fmtTime(mtn.durationSec)} @ {mtn.fps}fps</span>
+      <span class="chip mono">{mtn.columns} DoF</span>
+    {:else}
+      <span class="chip mono"><Icon name="cube" size={13} /> {robotName(library.previewRobot)} · Meshcat</span>
+    {/if}
   </div>
 
   {#if library.previewState === "loading"}
     <div class="loading-pane"><Spinner size={22} /> Loading {robotName(library.previewRobot)} model & retargeting motion…</div>
+  {:else if library.previewState === "error"}
+    <div class="loading-pane err"><Icon name="alert" size={20} /> {library.importError || "Preview failed to start."}</div>
   {:else if library.previewState === "ready"}
     <StreamView title="3D Motion Preview" url={library.previewUrl} name={mtn.name} stopLabel="Close preview" onStop={() => library.closePreview()} />
+    {#if mtn.frames > 0}
     <div class="transport">
       <button class="play" onclick={() => library.togglePlay()} aria-label={library.playing ? "Pause" : "Play"}>
         <Icon name={library.playing ? "pause" : "play"} size={16} />
@@ -93,6 +112,7 @@
         {/each}
       </div>
     </div>
+    {/if}
   {/if}
 
 {:else if library.previewKind === "policy" && pol}
@@ -125,7 +145,7 @@
   >
     {#snippet actions()}
       <Button variant="secondary" icon="cpu" onclick={() => policyInput?.click()}>Import Policy</Button>
-      <Button variant="primary" icon="import" onclick={() => motionInput?.click()}>Import Motion</Button>
+      <Button variant="primary" icon="import" onclick={importMotion}>Import Motion</Button>
     {/snippet}
   </PageHeader>
 
@@ -139,7 +159,7 @@
       <span class="dz-title">Import a motion or policy</span>
       <span class="dz-sub">A LAFAN1 <code>.csv</code> motion previews in Meshcat; an <code>.onnx</code> policy rolls out in Isaac Lab.</span>
       <div class="dz-actions">
-        <Button variant="primary" icon="import" onclick={() => motionInput?.click()}>Import Motion</Button>
+        <Button variant="primary" icon="import" onclick={importMotion}>Import Motion</Button>
         <Button variant="secondary" icon="cpu" onclick={() => policyInput?.click()}>Import Policy</Button>
       </div>
     </div>
@@ -221,6 +241,8 @@
   .chip :global(svg) { color: var(--gold); }
 
   .loading-pane { display: flex; align-items: center; justify-content: center; gap: 12px; min-height: 340px; border: 1px dashed var(--border-strong); border-radius: var(--r-md); background: var(--bg-base); font-family: var(--font-mono); font-size: 13px; color: var(--text-secondary); }
+  .loading-pane.err { color: var(--red-bright); border-color: color-mix(in srgb, var(--red) 45%, transparent); }
+  .loading-pane.err :global(svg) { color: var(--red-bright); }
 
   /* transport */
   .transport { display: flex; align-items: center; gap: 14px; margin-top: 14px; padding: 12px 16px; background: var(--bg-elev-1); border: 1px solid var(--border); border-radius: var(--r-md); }

@@ -13,6 +13,7 @@
  */
 
 import type { RobotType } from "./types";
+import { isTauri, startMotionPreview, stopMotionPreview } from "./tauri";
 
 export interface ImportedMotion {
   id: string;
@@ -22,6 +23,8 @@ export interface ImportedMotion {
   durationSec: number;
   columns: number; // degrees of freedom in the dataset
   importedAt: number;
+  /** Absolute path on disk (set when imported via the native dialog in Tauri). */
+  path?: string;
 }
 
 export interface ImportedPolicy {
@@ -36,7 +39,9 @@ export type PreviewState = "idle" | "loading" | "ready" | "error";
 export type PreviewKind = "motion" | "policy";
 
 const LAFAN_FPS = 30;
-const MESHCAT_URL = "http://127.0.0.1:7100/static/";
+// Default Meshcat web URL served by tools/meshcat_preview/meshcat_motion_preview.py.
+// The packaged app will instead read the URL the spawned backend prints.
+const MESHCAT_URL = "http://127.0.0.1:7000/static/";
 const ISAAC_URL = "http://127.0.0.1:8211/streaming/webrtc-client";
 
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -110,6 +115,24 @@ class Library {
     await this.openMotionPreview(motion.id);
   }
 
+  /** Import a motion by absolute path (native dialog, Tauri) and preview it. */
+  async importMotionFromPath(path: string): Promise<void> {
+    this.importError = "";
+    const name = path.split(/[/\\]/).pop() || path;
+    const motion: ImportedMotion = {
+      id: `m-${Date.now().toString(36)}`,
+      name,
+      path,
+      frames: 0, // unknown without parsing; the backend owns playback
+      fps: LAFAN_FPS,
+      durationSec: 0,
+      columns: 0,
+      importedAt: Date.now(),
+    };
+    this.motions = [motion, ...this.motions];
+    await this.openMotionPreview(motion.id);
+  }
+
   async openMotionPreview(id: string, robot?: RobotType): Promise<void> {
     this.previewKind = "motion";
     this.previewId = id;
@@ -117,6 +140,24 @@ class Library {
     this.frame = 0;
     this.playing = false;
     this.previewState = "loading";
+
+    const motion = this.motions.find((m) => m.id === id);
+    if (motion?.path && isTauri()) {
+      // Real backend: auto-spawn the Meshcat preview and embed its URL.
+      try {
+        const url = await startMotionPreview(motion.path, this.previewRobot);
+        if (this.previewId !== id) return;
+        this.previewUrl = url;
+        this.previewState = "ready";
+      } catch (e) {
+        if (this.previewId !== id) return;
+        this.previewState = "error";
+        this.importError = `Preview backend failed: ${e}`;
+      }
+      return;
+    }
+
+    // Mock (browser / no path): show the placeholder transport against MESHCAT_URL.
     await wait(1200);
     if (this.previewId !== id) return;
     this.previewUrl = MESHCAT_URL;
@@ -161,12 +202,14 @@ class Library {
 
   // ---------------- shared preview ----------------
   closePreview(): void {
+    const wasMotion = this.previewKind === "motion";
     this.previewKind = null;
     this.previewId = null;
     this.previewUrl = "";
     this.previewState = "idle";
     this.playing = false;
     this.frame = 0;
+    if (wasMotion && isTauri()) stopMotionPreview().catch(() => {});
   }
   togglePlay(): void {
     if (this.previewState === "ready" && this.previewKind === "motion") this.playing = !this.playing;

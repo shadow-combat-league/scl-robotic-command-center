@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import Icon from "./Icon.svelte";
   import Spinner from "./Spinner.svelte";
 
@@ -16,12 +17,48 @@
   let { url, name, title = "3D View", onStop, stopLabel = "Stop", fill = false }: Props = $props();
 
   let loading = $state(true);
+  let failed = $state(false);
   let reloadKey = $state(0);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  function arm() {
+    loading = true;
+    failed = false;
+    if (timer) clearTimeout(timer);
+    // Fast reachability probe — a refused localhost connection rejects almost
+    // immediately, so we don't sit on "Connecting…" when no server is up.
+    fetch(url, { mode: "no-cors", cache: "no-store" }).catch(() => {
+      if (loading) {
+        loading = false;
+        failed = true;
+      }
+    });
+    // Backstop: reachable but the viewer never finished loading.
+    timer = setTimeout(() => {
+      if (loading) {
+        loading = false;
+        failed = true;
+      }
+    }, 6000);
+  }
+
+  function onLoaded() {
+    loading = false;
+    failed = false;
+    if (timer) clearTimeout(timer);
+  }
 
   function reload() {
-    loading = true;
     reloadKey++;
+    arm();
   }
+
+  onMount(() => {
+    arm();
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
+  });
 </script>
 
 <div class="viewer" class:fill>
@@ -42,11 +79,22 @@
   </header>
 
   <div class="stage">
-    {#if loading}
+    {#if failed}
+      <div class="failed">
+        <Icon name="alert" size={22} />
+        <p class="f-title">Couldn't reach the viewer</p>
+        <code class="f-url mono">{url}</code>
+        <p class="f-hint">Make sure the {title} server is running at that address, then retry.</p>
+        <div class="f-actions">
+          <button class="f-btn primary" onclick={reload}>Retry</button>
+          <a class="f-btn" href={url} target="_blank" rel="noreferrer">Open in browser</a>
+        </div>
+      </div>
+    {:else if loading}
       <div class="loading"><Spinner size={20} /> Connecting…</div>
     {/if}
     {#key reloadKey}
-      <iframe class="frame" src={url} title={`${name} — ${title}`} onload={() => (loading = false)}></iframe>
+      <iframe class="frame" src={url} title={`${name} — ${title}`} onload={onLoaded}></iframe>
     {/key}
   </div>
 </div>
@@ -139,4 +187,32 @@
     color: var(--text-secondary);
     background: var(--bg-base);
   }
+  .failed {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 20px;
+    text-align: center;
+    background: var(--bg-base);
+  }
+  .failed :global(svg) { color: var(--amber); }
+  .f-title { font-size: 13.5px; font-weight: 600; color: var(--text-primary); }
+  .f-url { font-size: 11px; color: var(--text-faint); max-width: 90%; overflow: hidden; text-overflow: ellipsis; }
+  .f-hint { font-size: 12px; color: var(--text-muted); max-width: 42ch; }
+  .f-actions { display: flex; gap: 8px; margin-top: 8px; }
+  .f-btn {
+    font-family: var(--font-mono); font-size: 11px; font-weight: 600;
+    letter-spacing: 0.06em; text-transform: uppercase;
+    padding: 7px 13px; border-radius: var(--r-sm);
+    border: 1px solid var(--border-strong); background: var(--bg-elev-2); color: var(--text-secondary);
+    transition: all var(--transition);
+  }
+  .f-btn:hover { border-color: var(--gold); color: var(--gold-bright); }
+  .f-btn.primary { background: var(--gold); color: #1a1405; border-color: var(--gold); }
+  .f-btn.primary:hover { background: var(--gold-bright); }
 </style>
