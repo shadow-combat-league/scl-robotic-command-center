@@ -1,5 +1,5 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -15,6 +15,16 @@ struct PreviewState(Mutex<Option<Child>>);
 fn kill_existing(state: &PreviewState) {
     if let Ok(mut guard) = state.0.lock() {
         if let Some(mut child) = guard.take() {
+            // Graceful SIGTERM first (POSITIVE pid → only this process) so the
+            // python can shut down its meshcat server; then force-kill this exact
+            // child as a fallback. Never signal a process group.
+            #[cfg(unix)]
+            {
+                let _ = std::process::Command::new("kill")
+                    .arg(child.id().to_string())
+                    .status();
+                std::thread::sleep(Duration::from_millis(250));
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -91,6 +101,7 @@ fn start_motion_preview(
     state: tauri::State<PreviewState>,
     motion_path: String,
     robot: String,
+    start_paused: bool,
 ) -> Result<String, String> {
     kill_existing(&state);
 
@@ -104,8 +115,12 @@ fn start_motion_preview(
         .arg("--robot")
         .arg(robot_key)
         .arg("--loop")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    if start_paused {
+        cmd.arg("--start-paused");
+    }
     if let Some(gmr) = &paths.gmr_root {
         cmd.env("SCL_GMR_ROOT", gmr);
     }
@@ -159,6 +174,73 @@ fn stop_motion_preview(state: tauri::State<PreviewState>) -> Result<(), String> 
     Ok(())
 }
 
+/// Send a control line (e.g. "pause" / "resume") to the running preview backend.
+#[tauri::command]
+fn control_motion_preview(
+    state: tauri::State<PreviewState>,
+    command: String,
+) -> Result<(), String> {
+    let mut guard = state.0.lock().map_err(|_| "preview state poisoned")?;
+    let child = guard.as_mut().ok_or("no running preview")?;
+    let stdin = child.stdin.as_mut().ok_or("preview stdin unavailable")?;
+    writeln!(stdin, "{command}").map_err(|e| e.to_string())?;
+    stdin.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedFile {
+    path: String,
+    size_kb: u64,
+}
+
+fn library_dir(app: &tauri::AppHandle, subdir: &str) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("library")
+        .join(subdir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// Copy an imported file into the app's data dir (library/<subdir>/<dest_name>).
+#[tauri::command]
+fn save_library_file(
+    app: tauri::AppHandle,
+    src_path: String,
+    subdir: String,
+    dest_name: String,
+) -> Result<SavedFile, String> {
+    let dest = library_dir(&app, &subdir)?.join(&dest_name);
+    std::fs::copy(&src_path, &dest).map_err(|e| format!("copy failed: {e}"))?;
+    let size_kb = std::fs::metadata(&dest).map(|m| m.len().div_ceil(1024)).unwrap_or(0);
+    Ok(SavedFile {
+        path: dest.to_string_lossy().into_owned(),
+        size_kb,
+    })
+}
+
+/// Delete a previously-saved library file (must live under the app data dir).
+#[tauri::command]
+fn delete_library_file(app: tauri::AppHandle, path: String) -> Result<(), String> {
+    let lib_root = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("library");
+    let p = std::path::PathBuf::from(&path);
+    if !p.starts_with(&lib_root) {
+        return Err("refusing to delete a path outside the app library dir".into());
+    }
+    if p.exists() {
+        std::fs::remove_file(&p).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -167,7 +249,10 @@ pub fn run() {
         .manage(PreviewState::default())
         .invoke_handler(tauri::generate_handler![
             start_motion_preview,
-            stop_motion_preview
+            stop_motion_preview,
+            control_motion_preview,
+            save_library_file,
+            delete_library_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

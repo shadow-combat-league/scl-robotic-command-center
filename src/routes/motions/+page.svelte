@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import PageHeader from "$lib/components/PageHeader.svelte";
   import Panel from "$lib/components/Panel.svelte";
   import Button from "$lib/components/Button.svelte";
@@ -6,14 +7,38 @@
   import Spinner from "$lib/components/Spinner.svelte";
   import StatusPill from "$lib/components/StatusPill.svelte";
   import StreamView from "$lib/components/StreamView.svelte";
-  import { library } from "$lib/services/motions.svelte";
+  import { library, type ImportedMotion } from "$lib/services/motions.svelte";
+  import { robot } from "$lib/services/robot.svelte";
   import { ROBOT_TYPES } from "$lib/services/robotTypes";
   import type { RobotType } from "$lib/services/types";
-  import { isTauri, pickMotionFile } from "$lib/services/tauri";
+  import { isTauri, pickMotionFile, pickPolicyFile } from "$lib/services/tauri";
 
   let motionInput: HTMLInputElement;
   let policyInput: HTMLInputElement;
-  let pendingPolicyFile = $state<File | null>(null);
+  let pendingPolicy = $state<{ name: string; path?: string; file?: File } | null>(null);
+
+  // "Play on robots" picker
+  let playFor = $state<ImportedMotion | null>(null);
+  let playSelected = $state<string[]>([]);
+  let session = $derived(library.playSession);
+
+  onMount(() => library.load());
+
+  function openPlay(motion: ImportedMotion) {
+    playFor = motion;
+    playSelected = robot.onlineRobots.map((r) => r.id); // default: all connected
+  }
+  function togglePlayRobot(id: string) {
+    playSelected = playSelected.includes(id)
+      ? playSelected.filter((x) => x !== id)
+      : [...playSelected, id];
+  }
+  function confirmPlay() {
+    if (!playFor || playSelected.length === 0) return;
+    library.startPlaySession(playFor, playSelected);
+    playFor = null;
+    playSelected = [];
+  }
 
   // In the desktop app: native dialog → absolute path → auto-spawned Meshcat
   // preview. In the browser: fall back to the HTML file input (mock preview).
@@ -32,16 +57,27 @@
     if (file) await library.importMotionFromFile(file);
     input.value = "";
   }
+  async function importPolicy() {
+    if (isTauri()) {
+      const path = await pickPolicyFile();
+      if (path) pendingPolicy = { name: path.split(/[/\\]/).pop() || path, path };
+    } else {
+      policyInput?.click();
+    }
+  }
   function onPickPolicy(e: Event) {
     const input = e.currentTarget as HTMLInputElement;
     const file = input.files?.[0];
-    if (file) pendingPolicyFile = file; // ask which robot first
+    if (file) pendingPolicy = { name: file.name, file }; // ask which robot first
     input.value = "";
   }
   function choosePolicyRobot(robot: RobotType) {
     if (ROBOT_TYPES.find((r) => r.id === robot)?.comingSoon) return; // not yet available
-    if (pendingPolicyFile) library.importPolicy(pendingPolicyFile, robot);
-    pendingPolicyFile = null;
+    const p = pendingPolicy;
+    pendingPolicy = null;
+    if (!p) return;
+    if (p.path) library.importPolicyFromPath(p.path, robot);
+    else if (p.file) library.importPolicy(p.file, robot);
   }
 
   function robotName(t: RobotType): string {
@@ -155,7 +191,7 @@
     subtitle="Import LAFAN1 motion datasets (.csv) to preview in Meshcat, or RL policies (.onnx) to roll out in Isaac Lab."
   >
     {#snippet actions()}
-      <Button variant="secondary" icon="cpu" onclick={() => policyInput?.click()}>Import Policy</Button>
+      <Button variant="secondary" icon="cpu" onclick={importPolicy}>Import Policy</Button>
       <Button variant="primary" icon="import" onclick={importMotion}>Import Motion</Button>
     {/snippet}
   </PageHeader>
@@ -171,7 +207,7 @@
       <span class="dz-sub">A LAFAN1 <code>.csv</code> motion previews in Meshcat; an <code>.onnx</code> policy rolls out in Isaac Lab.</span>
       <div class="dz-actions">
         <Button variant="primary" icon="import" onclick={importMotion}>Import Motion</Button>
-        <Button variant="secondary" icon="cpu" onclick={() => policyInput?.click()}>Import Policy</Button>
+        <Button variant="secondary" icon="cpu" onclick={importPolicy}>Import Policy</Button>
       </div>
     </div>
   {:else}
@@ -187,7 +223,8 @@
                   <span class="rmeta mono">{item.frames} frames · {fmtTime(item.durationSec)} · {item.columns} DoF</span>
                 </span>
                 <StatusPill tone="cyan" dot={false}>LAFAN1</StatusPill>
-                <Button variant="secondary" size="sm" icon="play" onclick={() => library.openMotionPreview(item.id)}>Preview</Button>
+                <Button variant="ghost" size="sm" icon="cube" onclick={() => library.openMotionPreview(item.id)}>Preview</Button>
+                <Button variant="secondary" size="sm" icon="play" onclick={() => openPlay(item)}>Play</Button>
                 <button class="del" aria-label={`Remove ${item.name}`} title="Remove" onclick={() => library.removeMotion(item.id)}><Icon name="trash" size={15} /></button>
               </li>
             {/each}
@@ -217,13 +254,104 @@
   {/if}
 {/if}
 
-<!-- Policy → pick target robot -->
-{#if pendingPolicyFile}
+<!-- Motion → play on connected robots -->
+{#if playFor}
   <div class="overlay">
-    <button class="backdrop" aria-label="Cancel" onclick={() => (pendingPolicyFile = null)}></button>
+    <button class="backdrop" aria-label="Cancel" onclick={() => (playFor = null)}></button>
+    <div class="dialog" role="dialog" aria-modal="true" aria-label="Play motion on robots">
+      <h2>Play “{playFor.name}” on</h2>
+      {#if robot.onlineRobots.length === 0}
+        <p class="dlg-sub">No robots are connected. Connect one from the <a href="/robot">Robot console</a> first.</p>
+      {:else}
+        <p class="dlg-sub">Select the connected robots to play this motion on.</p>
+        <ul class="play-list">
+          {#each robot.onlineRobots as r (r.id)}
+            <li>
+              <button class="play-row" class:on={playSelected.includes(r.id)} onclick={() => togglePlayRobot(r.id)}>
+                <span class="pr-check">{#if playSelected.includes(r.id)}<Icon name="check" size={13} />{/if}</span>
+                <span class="pr-body">
+                  <span class="pr-name">{r.name}</span>
+                  <span class="pr-meta mono">{robot.modelName(r)} · {r.ip}</span>
+                </span>
+                <span class="pr-dot"></span>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <div class="dlg-actions">
+        <Button variant="ghost" onclick={() => (playFor = null)}>Cancel</Button>
+        {#if robot.onlineRobots.length}
+          <Button variant="primary" icon="play" disabled={playSelected.length === 0} onclick={confirmPlay}>
+            Play on {playSelected.length}
+          </Button>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Live playback session popup -->
+{#if session}
+  <div class="overlay">
+    <div class="session" role="dialog" aria-modal="true" aria-label="Motion playback">
+      <header class="s-head">
+        <span class="s-title"><Icon name="play" size={15} /> Playing <strong>{session.motionName}</strong></span>
+        <div class="s-robots">
+          {#each session.robotIds as id (id)}
+            <span class="s-chip">{robot.robots.find((r) => r.id === id)?.name ?? id}</span>
+          {/each}
+        </div>
+        <button class="s-x" aria-label="Stop &amp; close" title="Stop &amp; close" onclick={() => library.stopPlaySession()}>
+          <Icon name="x" size={16} />
+        </button>
+      </header>
+
+      <div class="s-body">
+        {#if session.state === "loading"}
+          <div class="loading-pane fill"><Spinner size={22} /> Starting playback…</div>
+        {:else if session.state === "error"}
+          <div class="loading-pane fill err"><Icon name="alert" size={20} /> Couldn't start playback.</div>
+        {:else}
+          <StreamView
+            fill
+            title="Playback · Meshcat"
+            url={session.url}
+            name={session.motionName}
+            stopLabel="Stop playback"
+            onStop={() => library.stopPlaySession()}
+          />
+        {/if}
+      </div>
+
+      <footer class="s-controls">
+        <span class="s-status mono">
+          {session.robotIds.length} robot{session.robotIds.length > 1 ? "s" : ""} · {session.paused ? "paused" : "playing"}
+        </span>
+        <div class="s-actions">
+          <Button
+            variant={session.paused ? "primary" : "secondary"}
+            size="sm"
+            icon={session.paused ? "play" : "pause"}
+            disabled={session.state !== "ready"}
+            onclick={() => library.togglePauseSession()}
+          >
+            {session.paused ? "Play" : "Pause"}
+          </Button>
+          <Button variant="danger" size="sm" icon="power" onclick={() => library.stopPlaySession()}>Stop</Button>
+        </div>
+      </footer>
+    </div>
+  </div>
+{/if}
+
+<!-- Policy → pick target robot -->
+{#if pendingPolicy}
+  <div class="overlay">
+    <button class="backdrop" aria-label="Cancel" onclick={() => (pendingPolicy = null)}></button>
     <div class="dialog" role="dialog" aria-modal="true" aria-label="Choose robot for policy">
       <h2>Which robot is this policy for?</h2>
-      <p class="dlg-sub">Choose the model <strong>{pendingPolicyFile.name}</strong> was trained for. It determines the embodiment Isaac Lab loads for the rollout.</p>
+      <p class="dlg-sub">Choose the model <strong>{pendingPolicy.name}</strong> was trained for. It determines the embodiment Isaac Lab loads for the rollout.</p>
       <div class="choices">
         {#each ROBOT_TYPES as t (t.id)}
           <button class="choice" class:soon={t.comingSoon} disabled={t.comingSoon} onclick={() => choosePolicyRobot(t.id)}>
@@ -234,7 +362,7 @@
         {/each}
       </div>
       <div class="dlg-actions">
-        <Button variant="ghost" onclick={() => (pendingPolicyFile = null)}>Cancel</Button>
+        <Button variant="ghost" onclick={() => (pendingPolicy = null)}>Cancel</Button>
       </div>
     </div>
   </div>
@@ -306,5 +434,32 @@
   .choice-icon { color: var(--gold); margin-bottom: 4px; }
   .choice-name { font-weight: 650; font-size: 14px; color: var(--text-primary); }
   .choice-vendor { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); }
-  .dlg-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+  .dlg-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
+
+  /* play-on-robots picker */
+  .play-list { list-style: none; display: flex; flex-direction: column; gap: 8px; margin: 16px 0 4px; max-height: 320px; overflow-y: auto; }
+  .play-row { width: 100%; display: flex; align-items: center; gap: 11px; padding: 11px 13px; background: var(--bg-elev-2); border: 1px solid var(--border-strong); border-radius: var(--r-md); color: var(--text-secondary); transition: all var(--transition); }
+  .play-row:hover { border-color: var(--gold); color: var(--text-primary); }
+  .play-row.on { border-color: var(--gold); background: var(--gold-tint); color: var(--text-primary); }
+  .pr-check { display: grid; place-items: center; width: 20px; height: 20px; flex: none; border-radius: var(--r-sm); border: 1px solid var(--border-strong); color: #1a1405; }
+  .play-row.on .pr-check { background: var(--gold); border-color: var(--gold); }
+  .pr-body { display: flex; flex-direction: column; gap: 1px; margin-right: auto; text-align: left; min-width: 0; }
+  .pr-name { font-weight: 600; font-size: 13px; }
+  .pr-meta { font-size: 11px; color: var(--text-muted); }
+  .pr-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); flex: none; }
+
+  /* live playback session popup */
+  .session { position: relative; width: min(1040px, 94vw); height: min(86vh, 820px); display: flex; flex-direction: column; background: var(--bg-elev-1); border: 1px solid var(--border-strong); border-radius: var(--r-lg); box-shadow: var(--shadow-2); overflow: hidden; }
+  .s-head { display: flex; align-items: center; gap: 14px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); }
+  .s-title { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text-secondary); white-space: nowrap; }
+  .s-title strong { color: var(--text-primary); }
+  .s-title :global(svg) { color: var(--green); }
+  .s-robots { display: flex; gap: 6px; flex-wrap: wrap; margin-right: auto; }
+  .s-chip { font-family: var(--font-mono); font-size: 11px; color: var(--green); background: var(--green-tint); border: 1px solid color-mix(in srgb, var(--green) 40%, transparent); border-radius: var(--r-pill); padding: 3px 9px; }
+  .s-x { display: grid; place-items: center; width: 30px; height: 30px; flex: none; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--bg-elev-2); color: var(--text-secondary); transition: all var(--transition); }
+  .s-x:hover { color: var(--red-bright); border-color: var(--red); background: var(--red-tint); }
+  .s-body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 14px; }
+  .s-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--border-soft); }
+  .s-status { font-size: 12px; color: var(--text-muted); }
+  .s-actions { display: flex; gap: 8px; }
 </style>

@@ -1,19 +1,28 @@
 /**
  * Motion & policy library.
  *
- * - Motions: LAFAN1 `.csv` datasets. Parsed for real (frames/columns/duration),
- *   previewed in Meshcat retargeted onto a chosen robot model.
- * - Policies: `.onnx` files. The user picks the target robot (G1 / T800) at
- *   import time; the rollout is previewed in an embedded Isaac Lab stream.
+ * - Motions: LAFAN1 `.csv` datasets, previewed in Meshcat.
+ * - Policies: `.onnx` files (target robot chosen at import), previewed in Isaac Lab.
  *
- * MOCK-FIRST: parsing is real; the 3D/sim previews simulate spinning up the
- * backend (Meshcat server / Isaac Lab headless + WebRTC) and point an iframe at
- * its web URL. The real version is a Tauri Rust command that launches the
- * backend and returns the URL — this surface doesn't change.
+ * Imported files are COPIED into the app's data dir (library/{motions,policies})
+ * via Tauri so they're owned by the app, and the copy is DELETED when the user
+ * removes the entry. The library (metadata + stored path) is persisted to
+ * localStorage so it survives restarts.
+ *
+ * MOCK-FIRST seam: in the browser (no Tauri) there's no app data dir, so imports
+ * stay in-memory; the 3D/sim previews fall back to placeholder URLs.
  */
 
 import type { RobotType } from "./types";
-import { isTauri, startMotionPreview, stopMotionPreview } from "./tauri";
+import { robot } from "./robot.svelte";
+import {
+  isTauri,
+  startMotionPreview,
+  stopMotionPreview,
+  controlMotionPreview,
+  saveLibraryFile,
+  deleteLibraryFile,
+} from "./tauri";
 
 export interface ImportedMotion {
   id: string;
@@ -23,7 +32,7 @@ export interface ImportedMotion {
   durationSec: number;
   columns: number; // degrees of freedom in the dataset
   importedAt: number;
-  /** Absolute path on disk (set when imported via the native dialog in Tauri). */
+  /** Path of the app-owned copy in the data dir (Tauri). */
   path?: string;
 }
 
@@ -33,18 +42,38 @@ export interface ImportedPolicy {
   robot: RobotType; // chosen explicitly at import
   sizeKb: number;
   importedAt: number;
+  /** Path of the app-owned copy in the data dir (Tauri). */
+  path?: string;
 }
 
 export type PreviewState = "idle" | "loading" | "ready" | "error";
 export type PreviewKind = "motion" | "policy";
 
+/** A live "play motion on robots" session (popup with the Meshcat view + controls). */
+export interface PlaySession {
+  id: string;
+  motionId: string;
+  motionName: string;
+  robotIds: string[];
+  state: PreviewState;
+  url: string;
+  paused: boolean;
+}
+
 const LAFAN_FPS = 30;
-// Default Meshcat web URL served by tools/meshcat_preview/meshcat_motion_preview.py.
-// The packaged app will instead read the URL the spawned backend prints.
+const LIB_KEY = "scl-ccc.library";
 const MESHCAT_URL = "http://127.0.0.1:7000/static/";
 const ISAAC_URL = "http://127.0.0.1:8211/streaming/webrtc-client";
 
 const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+function baseName(path: string): string {
+  return path.split(/[/\\]/).pop() || path;
+}
+function extOf(name: string, fallback: string): string {
+  const i = name.lastIndexOf(".");
+  return i > 0 ? name.slice(i) : fallback;
+}
 
 /** Lightweight LAFAN1 CSV parse — frame/column counts, or null if not motion data. */
 function parseLafan(text: string): { frames: number; columns: number } | null {
@@ -76,6 +105,35 @@ class Library {
   frame = $state(0);
   speed = $state(1);
 
+  // live "play on robots" session
+  playSession = $state<PlaySession | null>(null);
+
+  #loaded = false;
+
+  /** Restore the persisted library (call once on mount). */
+  load(): void {
+    if (this.#loaded) return;
+    this.#loaded = true;
+    if (typeof localStorage === "undefined") return;
+    try {
+      const raw = localStorage.getItem(LIB_KEY);
+      if (!raw) return;
+      const data = JSON.parse(raw) as { motions?: ImportedMotion[]; policies?: ImportedPolicy[] };
+      this.motions = data.motions ?? [];
+      this.policies = data.policies ?? [];
+    } catch {
+      /* ignore corrupt store */
+    }
+  }
+
+  #persist(): void {
+    if (typeof localStorage === "undefined") return;
+    localStorage.setItem(
+      LIB_KEY,
+      JSON.stringify({ motions: this.motions, policies: this.policies }),
+    );
+  }
+
   get previewMotion(): ImportedMotion | null {
     return this.previewKind === "motion"
       ? this.motions.find((m) => m.id === this.previewId) ?? null
@@ -88,6 +146,7 @@ class Library {
   }
 
   // ---------------- motions ----------------
+  /** Browser fallback: read + validate a File, keep in memory (no app-data copy). */
   async importMotionFromFile(file: File): Promise<void> {
     this.importError = "";
     let text: string;
@@ -112,24 +171,35 @@ class Library {
       importedAt: Date.now(),
     };
     this.motions = [motion, ...this.motions];
+    this.#persist();
     await this.openMotionPreview(motion.id);
   }
 
-  /** Import a motion by absolute path (native dialog, Tauri) and preview it. */
-  async importMotionFromPath(path: string): Promise<void> {
+  /** Tauri: copy the picked motion into the app data dir, persist, then preview. */
+  async importMotionFromPath(srcPath: string): Promise<void> {
     this.importError = "";
-    const name = path.split(/[/\\]/).pop() || path;
+    const name = baseName(srcPath);
+    const id = `m-${Date.now().toString(36)}`;
+    let storedPath: string;
+    try {
+      const saved = await saveLibraryFile(srcPath, "motions", `${id}${extOf(name, ".csv")}`);
+      storedPath = saved.path;
+    } catch (e) {
+      this.importError = `Couldn't save “${name}” into the app: ${e}`;
+      return;
+    }
     const motion: ImportedMotion = {
-      id: `m-${Date.now().toString(36)}`,
+      id,
       name,
-      path,
-      frames: 0, // unknown without parsing; the backend owns playback
+      path: storedPath,
+      frames: 0, // backend owns playback; metadata not parsed from path
       fps: LAFAN_FPS,
       durationSec: 0,
       columns: 0,
       importedAt: Date.now(),
     };
     this.motions = [motion, ...this.motions];
+    this.#persist();
     await this.openMotionPreview(motion.id);
   }
 
@@ -143,7 +213,6 @@ class Library {
 
     const motion = this.motions.find((m) => m.id === id);
     if (motion?.path && isTauri()) {
-      // Real backend: auto-spawn the Meshcat preview and embed its URL.
       try {
         const url = await startMotionPreview(motion.path, this.previewRobot);
         if (this.previewId !== id) return;
@@ -157,7 +226,7 @@ class Library {
       return;
     }
 
-    // Mock (browser / no path): show the placeholder transport against MESHCAT_URL.
+    // Mock (browser / no stored file): placeholder transport against MESHCAT_URL.
     await wait(1200);
     if (this.previewId !== id) return;
     this.previewUrl = MESHCAT_URL;
@@ -172,6 +241,7 @@ class Library {
   }
 
   // ---------------- policies ----------------
+  /** Browser fallback: validate an .onnx File, keep in memory (no app-data copy). */
   importPolicy(file: File, robot: RobotType): void {
     this.importError = "";
     if (!file.name.toLowerCase().endsWith(".onnx")) {
@@ -186,6 +256,36 @@ class Library {
       importedAt: Date.now(),
     };
     this.policies = [policy, ...this.policies];
+    this.#persist();
+    this.openPolicyPreview(policy.id);
+  }
+
+  /** Tauri: copy the picked .onnx into the app data dir, persist, then preview. */
+  async importPolicyFromPath(srcPath: string, robot: RobotType): Promise<void> {
+    this.importError = "";
+    const name = baseName(srcPath);
+    if (!name.toLowerCase().endsWith(".onnx")) {
+      this.importError = `“${name}” isn't an .onnx policy file.`;
+      return;
+    }
+    const id = `p-${Date.now().toString(36)}`;
+    let stored: { path: string; sizeKb: number };
+    try {
+      stored = await saveLibraryFile(srcPath, "policies", `${id}.onnx`);
+    } catch (e) {
+      this.importError = `Couldn't save “${name}” into the app: ${e}`;
+      return;
+    }
+    const policy: ImportedPolicy = {
+      id,
+      name,
+      robot,
+      sizeKb: stored.sizeKb,
+      importedAt: Date.now(),
+      path: stored.path,
+    };
+    this.policies = [policy, ...this.policies];
+    this.#persist();
     this.openPolicyPreview(policy.id);
   }
 
@@ -229,13 +329,71 @@ class Library {
     this.frame = f;
   }
 
-  removeMotion(id: string): void {
-    this.motions = this.motions.filter((m) => m.id !== id);
-    if (this.previewKind === "motion" && this.previewId === id) this.closePreview();
+  // ---------------- live playback session ----------------
+  /** Trigger on-robot playback and open the live Meshcat popup. */
+  async startPlaySession(motion: ImportedMotion, robotIds: string[]): Promise<void> {
+    robot.playMotionOn(robotIds, motion.name);
+    const id = `play-${Date.now().toString(36)}`;
+    this.playSession = {
+      id,
+      motionId: motion.id,
+      motionName: motion.name,
+      robotIds: [...robotIds],
+      state: "loading",
+      url: "",
+      paused: true, // armed — starts paused; the popup's Play button resumes it
+    };
+    const targetType =
+      robot.robots.find((r) => r.id === robotIds[0])?.type ?? this.previewRobot;
+    let url = MESHCAT_URL;
+    let ok = true;
+    if (motion.path && isTauri()) {
+      try {
+        url = await startMotionPreview(motion.path, targetType, true); // start paused
+      } catch {
+        ok = false;
+      }
+    } else {
+      await wait(1200);
+    }
+    if (this.playSession?.id !== id) return; // stopped or superseded
+    if (ok) {
+      this.playSession.url = url;
+      this.playSession.state = "ready";
+    } else {
+      this.playSession.state = "error";
+    }
   }
-  removePolicy(id: string): void {
-    this.policies = this.policies.filter((p) => p.id !== id);
+
+  stopPlaySession(): void {
+    const s = this.playSession;
+    if (!s) return;
+    this.playSession = null;
+    robot.stopMotionOn(s.robotIds, s.motionName);
+    if (isTauri()) stopMotionPreview().catch(() => {});
+  }
+
+  togglePauseSession(): void {
+    if (!this.playSession) return;
+    this.playSession.paused = !this.playSession.paused;
+    if (isTauri()) {
+      controlMotionPreview(this.playSession.paused ? "pause" : "resume").catch(() => {});
+    }
+  }
+
+  async removeMotion(id: string): Promise<void> {
+    const m = this.motions.find((x) => x.id === id);
+    this.motions = this.motions.filter((x) => x.id !== id);
+    if (this.previewKind === "motion" && this.previewId === id) this.closePreview();
+    if (m?.path && isTauri()) await deleteLibraryFile(m.path).catch(() => {});
+    this.#persist();
+  }
+  async removePolicy(id: string): Promise<void> {
+    const p = this.policies.find((x) => x.id === id);
+    this.policies = this.policies.filter((x) => x.id !== id);
     if (this.previewKind === "policy" && this.previewId === id) this.closePreview();
+    if (p?.path && isTauri()) await deleteLibraryFile(p.path).catch(() => {});
+    this.#persist();
   }
 }
 

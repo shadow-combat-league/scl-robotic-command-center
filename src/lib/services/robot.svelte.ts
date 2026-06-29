@@ -168,6 +168,23 @@ class RobotService {
     this.#log("info", `${name}: ${posture}`);
   }
 
+  /** Play a motion on the given (online) robots. MOCK — logs to the activity feed. */
+  playMotionOn(ids: string[], motionName: string): void {
+    for (const id of ids) {
+      if (!this.isOnline(id)) continue;
+      const name = this.robots.find((r) => r.id === id)?.name ?? "robot";
+      this.#log("success", `${name}: playing motion “${motionName}”`);
+    }
+  }
+
+  /** Stop a playing motion on the given robots. MOCK — logs to the activity feed. */
+  stopMotionOn(ids: string[], motionName: string): void {
+    for (const id of ids) {
+      const name = this.robots.find((r) => r.id === id)?.name ?? "robot";
+      this.#log("info", `${name}: stopped motion “${motionName}”`);
+    }
+  }
+
   // --- teleoperation (per robot) ---
   teleopStateOf(id: string): TeleopState {
     return this.teleop[id] ?? "stopped";

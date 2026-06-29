@@ -128,6 +128,8 @@ def main() -> None:
     ap.add_argument("--robot", default="unitree_g1", help="GMR robot key")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--loop", action="store_true")
+    ap.add_argument("--start-paused", action="store_true",
+                    help="render the first frame, then wait for a 'resume' before playing")
     args = ap.parse_args()
 
     try:
@@ -170,10 +172,60 @@ def main() -> None:
     print(f"[meshcat-preview] MESHCAT_URL={vis.url()}", flush=True)
     geom_local = build_scene(vis, model, mj, mg)
 
+    # Ensure the meshcat server subprocess dies with us (on SIGTERM / clean exit),
+    # so it doesn't leak. The app stops us with a graceful SIGTERM.
+    import atexit
+    import signal
+
+    def _shutdown(*_):
+        try:
+            proc = getattr(getattr(vis, "window", None), "server_proc", None)
+            if proc is not None:
+                proc.terminate()
+        except Exception:
+            pass
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    atexit.register(_shutdown)
+
+    # Control channel: the app writes pause/resume/stop lines to stdin.
+    import threading
+
+    paused = threading.Event()
+
+    def _stdin_control():
+        try:
+            for line in sys.stdin:
+                cmd = line.strip().lower()
+                if cmd == "pause":
+                    paused.set()
+                elif cmd == "resume":
+                    paused.clear()
+                elif cmd == "stop":
+                    os._exit(0)
+        except Exception:
+            pass
+
+    threading.Thread(target=_stdin_control, daemon=True).start()
+
+    # Render the starting pose so the popup shows the robot before playback; if
+    # armed, hold there until the app sends "resume" (the popup's Play button).
+    if n > 0:
+        q0 = get_qpos(0)
+        data.qpos[: len(q0)] = q0
+        mj.mj_forward(model, data)
+        update_scene(vis, model, data, geom_local)
+    if args.start_paused:
+        paused.set()
+
     dt = 1.0 / args.fps
     i = 0
     print(f"[meshcat-preview] playing {n} frames @ {args.fps}fps")
     while True:
+        if paused.is_set():
+            time.sleep(0.05)  # hold the current pose
+            continue
         qpos = get_qpos(i)
         data.qpos[: len(qpos)] = qpos
         mj.mj_forward(model, data)
