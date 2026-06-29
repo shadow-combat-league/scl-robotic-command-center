@@ -25,9 +25,23 @@
   let conn = $derived(robot.connectionOf(profile.id));
   let tel = $derived(robot.telemetryOf(profile.id));
   let posture = $derived(robot.postureOf(profile.id));
+  // Robot-specific fields (battery/temp/joints) are only meaningful when the
+  // agent reports them live via DDS; undefined (mock) counts as available.
+  let robotAvail = $derived(tel.robotStateAvailable !== false);
+  let cmd = $derived(robot.commandStateOf(profile.id));
   let estopped = $derived(conn === "online" && tel.estop);
 
-  const POSTURES = ["stand", "sit", "damp"];
+  // High-level modes commanded on the robot (maps to the agent's LocoClient actions).
+  const MODES: { key: string; label: string }[] = [
+    { key: "damp", label: "Damp" },
+    { key: "sit", label: "Sit" },
+    { key: "stand", label: "Locked Standing" },
+    { key: "run", label: "Run" },
+  ];
+  // Friendly label for a command key (the key is the agent's protocol token).
+  function modeLabel(key: string): string {
+    return MODES.find((m) => m.key === key)?.label ?? key;
+  }
 
   function uptime(sec: number): string {
     return `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, "0")}s`;
@@ -68,42 +82,59 @@
   {:else if conn !== "online"}
     <div class="offline">
       <span class="meta mono">{profile.sshUser}@{profile.ip}{#if profile.wifiSsid} · {profile.wifiSsid}{/if}</span>
-      <Button variant="primary" size="sm" icon="plug" onclick={() => robot.connect(profile.id)}>
-        Connect
-      </Button>
+      {#if conn === "error"}
+        <span class="meta err">Unreachable at {profile.ip}.</span>
+      {/if}
+      <div class="offline-actions">
+        <Button variant="primary" size="sm" icon="plug" onclick={() => robot.connect(profile.id)}>Connect</Button>
+        <Button variant="ghost" size="sm" icon="setup" href={`/setup?reonboard=${profile.id}`}>Fix Wi-Fi</Button>
+      </div>
     </div>
   {:else}
     <!-- live telemetry -->
     <div class="stats">
       <div class="stat batt">
-        <span class="stat-top"><Icon name="battery" size={15} /><span class="stat-key">Battery</span><span class="stat-val mono">{tel.battery}%</span></span>
-        <span class="bar"><span class="fill" style="width:{tel.battery}%;background:{battTone(tel.battery)}"></span></span>
+        <span class="stat-top"><Icon name="battery" size={15} /><span class="stat-key">Battery</span><span class="stat-val mono">{robotAvail ? `${tel.battery}%` : "—"}</span></span>
+        <span class="bar"><span class="fill" style="width:{robotAvail ? tel.battery : 0}%;background:{battTone(tel.battery)}"></span></span>
       </div>
-      <div class="stat"><Icon name="temp" size={15} /><span class="stat-key">Temp</span><span class="stat-val mono">{tel.temperature}°</span></div>
+      <div class="stat"><Icon name="temp" size={15} /><span class="stat-key">Temp</span><span class="stat-val mono">{robotAvail ? `${tel.temperature}°` : "—"}</span></div>
       <div class="stat"><Icon name="cpu" size={15} /><span class="stat-key">CPU</span><span class="stat-val mono">{tel.cpuLoad}%</span></div>
+      <div class="stat"><Icon name="cube" size={15} /><span class="stat-key">Memory</span><span class="stat-val mono">{tel.memory != null ? `${tel.memory}%` : "—"}</span></div>
       <div class="stat"><Icon name="clock" size={15} /><span class="stat-key">Uptime</span><span class="stat-val mono">{uptime(tel.uptimeSec)}</span></div>
     </div>
 
     <div class="controls">
-      <span class="ctl-label label">Posture</span>
+      <span class="ctl-label label">Mode</span>
       <div class="ctl-btns">
-        {#each POSTURES as p (p)}
+        {#each MODES as m (m.key)}
           <button
             class="ctl"
-            class:active={posture === p}
-            disabled={estopped}
-            onclick={() => robot.setPosture(profile.id, p)}
-          >{p}</button>
+            class:active={posture === m.key}
+            disabled={estopped || cmd?.phase === "sending"}
+            onclick={() => robot.setPosture(profile.id, m.key)}
+          >{m.label}</button>
         {/each}
       </div>
+      {#if cmd}
+        <div class="cmd" class:err={cmd.phase === "error"} class:ok={cmd.phase === "ok"}>
+          {#if cmd.phase === "sending"}
+            <Spinner size={12} /> <span>Sending “{modeLabel(cmd.action)}”…</span>
+          {:else if cmd.phase === "error"}
+            <Icon name="alert" size={13} /> <span>“{modeLabel(cmd.action)}” failed — {cmd.msg}</span>
+          {:else}
+            <Icon name="check" size={13} /> <span>{cmd.msg || `${modeLabel(cmd.action)} engaged`}</span>
+          {/if}
+        </div>
+      {/if}
     </div>
 
     {#if expanded}
       <dl class="detail">
-        <div><dt>Joints</dt><dd class="mono" class:ok={tel.jointsOk}>{tel.jointsOk ? "23 / 23 OK" : "FAULT"}</dd></div>
+        <div><dt>Joints</dt><dd class="mono" class:ok={robotAvail && tel.jointsOk}>{robotAvail ? (tel.jointsOk ? "23 / 23 OK" : "FAULT") : "—"}</dd></div>
         <div><dt>Posture</dt><dd class="mono">{posture}</dd></div>
         <div><dt>Firmware</dt><dd class="mono">{robotTypeSpec(profile.type).vendor} · {profile.type}</dd></div>
         <div><dt>Address</dt><dd class="mono">{profile.ip}</dd></div>
+        <div><dt>Host</dt><dd class="mono">{tel.hostname ?? "—"}</dd></div>
         <div><dt>Wi-Fi</dt><dd class="mono">{profile.wifiSsid ?? "—"}</dd></div>
       </dl>
     {/if}
@@ -196,6 +227,8 @@
     display: flex; flex-direction: column; align-items: flex-start; gap: 10px;
   }
   .offline .meta { font-size: 11.5px; color: var(--text-muted); }
+  .offline .meta.err { color: var(--red-bright); }
+  .offline-actions { display: flex; gap: 8px; }
 
   /* telemetry */
   .stats {
@@ -237,6 +270,17 @@
   .ctl:hover:not(:disabled) { border-color: var(--gold); color: var(--gold-bright); }
   .ctl.active { background: var(--gold-tint); border-color: var(--gold); color: var(--gold-bright); }
   .ctl:disabled { opacity: 0.4; }
+
+  .cmd {
+    display: flex; align-items: center; gap: 7px;
+    margin-top: 2px;
+    font-family: var(--font-mono); font-size: 11px; line-height: 1.4;
+    color: var(--text-secondary);
+  }
+  .cmd :global(svg) { flex: none; color: var(--text-secondary); }
+  .cmd.ok, .cmd.ok :global(svg) { color: var(--green-bright); }
+  .cmd.err, .cmd.err :global(svg) { color: var(--red-bright); }
+  .cmd span { min-width: 0; word-break: break-word; }
 
   /* detail (expanded) */
   .detail { display: flex; flex-direction: column; border-top: 1px solid var(--border-soft); padding-top: 4px; }

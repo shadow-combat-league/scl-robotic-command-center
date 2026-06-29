@@ -13,6 +13,7 @@
 
 import { db } from "./db";
 import { robotTypeSpec } from "./robotTypes";
+import { isTauri, robotReachable, fetchTelemetry, robotCommand } from "./tauri";
 import type {
   ActivityEvent,
   ConnectionState,
@@ -45,6 +46,29 @@ function seedTelemetry(id: string): Telemetry {
   };
 }
 
+/**
+ * Merge a raw telemetry snapshot from the on-robot agent into the existing
+ * Telemetry. OS metrics (cpu/memory/uptime) always apply; robot-specific fields
+ * (battery/temperature/jointsOk) only when the agent reports them live via DDS,
+ * otherwise they read as "unavailable". `estop` stays a command-side concept
+ * (the agent's value is best-effort) so the E-Stop / All-Stop buttons keep working.
+ */
+function mergeTelemetry(prev: Telemetry, raw: Record<string, unknown>): Telemetry {
+  const robotAvail = raw.robotStateAvailable === true;
+  const num = (v: unknown, fallback: number) => (typeof v === "number" ? v : fallback);
+  return {
+    battery: robotAvail ? num(raw.battery, prev.battery) : 0,
+    temperature: robotAvail ? num(raw.temperature, prev.temperature) : 0,
+    cpuLoad: num(raw.cpuLoad, prev.cpuLoad),
+    memory: typeof raw.memory === "number" ? raw.memory : prev.memory,
+    uptimeSec: num(raw.uptimeSec, prev.uptimeSec),
+    jointsOk: robotAvail ? raw.jointsOk === true : prev.jointsOk,
+    estop: prev.estop,
+    hostname: typeof raw.hostname === "string" ? raw.hostname : prev.hostname,
+    robotStateAvailable: robotAvail,
+  };
+}
+
 class RobotService {
   robots = $state<RobotProfile[]>([]);
 
@@ -55,11 +79,17 @@ class RobotService {
   /** Teleoperation script state + the Meshcat viewer URL it publishes to. */
   teleop = $state<Record<string, TeleopState>>({});
   meshcatUrls = $state<Record<string, string>>({});
+  /** Result of the most recent mode command per robot (for inline UI feedback). */
+  cmdState = $state<
+    Record<string, { action: string; phase: "sending" | "ok" | "error"; msg: string }>
+  >({});
 
   activity = $state<ActivityEvent[]>([]);
 
   #loaded = false;
   #ticking = false;
+  /** Consecutive telemetry-fetch failures per robot id (drives offline detection). */
+  #misses: Record<string, number> = {};
 
   load(): void {
     if (this.#loaded) return;
@@ -87,6 +117,9 @@ class RobotService {
   }
   postureOf(id: string): string {
     return this.postures[id] ?? "idle";
+  }
+  commandStateOf(id: string) {
+    return this.cmdState[id];
   }
   isOnline(id: string): boolean {
     return this.connectionOf(id) === "online";
@@ -123,6 +156,16 @@ class RobotService {
       this.#log("success", `${profile.name} onboarded — reachable at ${profile.ip}`);
     }
   }
+  /** Persist a robot's new Wi-Fi IP/SSID (+ agent port) after a re-onboard. */
+  updateConnection(
+    id: string,
+    patch: { ip: string; wifiSsid: string | null; apiPort?: number },
+  ): void {
+    this.robots = db.updateProfile(id, patch);
+    this.#initRuntime(id);
+    const name = this.robots.find((r) => r.id === id)?.name ?? "robot";
+    this.#log("success", `${name} reconnected — reachable at ${patch.ip}`);
+  }
   remove(id: string): void {
     this.robots = db.deleteProfile(id);
     delete this.connections[id];
@@ -137,11 +180,56 @@ class RobotService {
     const r = this.robots.find((x) => x.id === id);
     if (!r || this.connectionOf(id) === "online") return;
     this.connections[id] = "connecting";
-    await wait(900);
+    // In the app, verify the saved IP actually responds; in the browser, mock it.
+    if (isTauri()) {
+      const ok = await robotReachable(r.ip).catch(() => false);
+      if (!ok) {
+        this.connections[id] = "error";
+        this.#log("error", `${r.name} unreachable at ${r.ip} — re-onboard to fix Wi-Fi`);
+        return;
+      }
+    } else {
+      await wait(900);
+    }
     this.connections[id] = "online";
     this.telemetry[id] = seedTelemetry(id);
     this.postures[id] = "idle";
+    this.#misses[id] = 0;
+    if (isTauri()) {
+      const ok = await this.#refreshTelemetry(id);
+      if (!ok) {
+        this.#log("warn", `${r.name}: telemetry agent not responding — re-onboard to redeploy`);
+      }
+    }
     this.#log("success", `Connected to ${r.name}`);
+  }
+
+  /** Pull a fresh telemetry snapshot from the robot's agent into state. */
+  async #refreshTelemetry(id: string): Promise<boolean> {
+    const r = this.robots.find((x) => x.id === id);
+    if (!r) return false;
+    try {
+      const raw = await fetchTelemetry(r.ip, r.apiPort ?? 8472);
+      this.telemetry[id] = mergeTelemetry(this.telemetryOf(id), raw);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** One real-telemetry poll for a robot; flips it to "error" after 3 misses. */
+  async #tickRobot(r: RobotProfile): Promise<void> {
+    if (this.connectionOf(r.id) !== "online") return;
+    if (await this.#refreshTelemetry(r.id)) {
+      this.#misses[r.id] = 0;
+      return;
+    }
+    this.#misses[r.id] = (this.#misses[r.id] ?? 0) + 1;
+    if (this.#misses[r.id] >= 3) {
+      this.connections[r.id] = "error";
+      this.#misses[r.id] = 0;
+      this.#log("error", `${r.name}: telemetry agent unreachable — re-onboard to redeploy`);
+    }
   }
 
   disconnect(id: string): void {
@@ -160,11 +248,35 @@ class RobotService {
     this.#log(t.estop ? "error" : "info", `${name}: E-stop ${t.estop ? "engaged" : "released"}`);
   }
 
-  setPosture(id: string, posture: string): void {
+  /**
+   * Command a high-level mode (damp / sit / stand / run). In the desktop app this
+   * is sent to the robot's agent (→ Unitree LocoClient FSM); in the browser it's
+   * a mock that just updates the local highlight + activity feed.
+   */
+  async setPosture(id: string, posture: string): Promise<void> {
     if (!this.isOnline(id)) return;
     if (this.telemetryOf(id).estop) return; // can't command while E-stopped
     this.postures[id] = posture;
-    const name = this.robots.find((r) => r.id === id)?.name ?? "robot";
+    const r = this.robots.find((x) => x.id === id);
+    const name = r?.name ?? "robot";
+    if (isTauri() && r) {
+      this.cmdState[id] = { action: posture, phase: "sending", msg: "" };
+      try {
+        await robotCommand(r.ip, r.apiPort ?? 8472, posture);
+        this.cmdState[id] = { action: posture, phase: "ok", msg: "" };
+        this.#log("info", `${name}: ${posture} command sent`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.cmdState[id] = { action: posture, phase: "error", msg };
+        this.#log("error", `${name}: ${posture} failed — ${msg}`);
+      }
+      return;
+    }
+    this.cmdState[id] = {
+      action: posture,
+      phase: "ok",
+      msg: "simulated — open the desktop app to command the robot",
+    };
     this.#log("info", `${name}: ${posture}`);
   }
 
@@ -292,10 +404,22 @@ class RobotService {
     ].slice(0, 40);
   }
 
-  /** Simulated telemetry tick — call once on app start; updates all online robots. */
+  /**
+   * Telemetry tick — call once on app start. In the desktop app this polls each
+   * online robot's on-robot agent over HTTP; in the browser it random-walks the
+   * mock values so the UI still feels alive.
+   */
   startTelemetry(): void {
     if (this.#ticking) return;
     this.#ticking = true;
+    if (isTauri()) {
+      setInterval(() => {
+        for (const r of this.robots) {
+          if (this.connectionOf(r.id) === "online") void this.#tickRobot(r);
+        }
+      }, 3000);
+      return;
+    }
     setInterval(() => {
       for (const r of this.robots) {
         if (this.connectionOf(r.id) !== "online") continue;

@@ -29,11 +29,11 @@ echo "==> creating relocatable standalone Python ($PYVER)"
 uv venv --python "$PYVER" --relocatable "$RES/pyenv"
 PY="$RES/pyenv/bin/python"
 
-echo "==> installing retarget + viewer deps (no pinocchio)"
+echo "==> installing retarget + viewer + onboarding deps (no pinocchio)"
 # Exactly what GMR's package __init__ + our renderer import (not the heavy
-# script-only deps: smplx/opencv/redis/ffmpeg).
+# script-only deps: smplx/opencv/redis/ffmpeg). paramiko = SSH for onboarding.
 uv pip install --python "$PY" \
-  numpy scipy mujoco mink rich imageio loop-rate-limiters meshcat
+  numpy scipy mujoco mink rich imageio loop-rate-limiters meshcat paramiko
 
 echo "==> bundling GMR (package + only the robot assets we use; no .git/other robots)"
 mkdir -p "$RES/GMR/assets"
@@ -53,9 +53,12 @@ t = t.replace("from .neck_retarget import human_head_to_robot_neck",
 p.write_text(t); print("  patched")
 PYEOF
 
-echo "==> bundling preview script"
-mkdir -p "$RES/meshcat_preview"
+echo "==> bundling preview + onboarding + agent scripts"
+mkdir -p "$RES/meshcat_preview" "$RES/robot_onboard" "$RES/robot_agent"
 cp "$HERE/meshcat_motion_preview.py" "$RES/meshcat_preview/"
+cp "$REPO/tools/robot_onboard/onboard.py" "$RES/robot_onboard/"
+# Deployed onto the robot during onboarding (stdlib-only telemetry server).
+cp "$REPO/tools/robot_agent/agent.py" "$RES/robot_agent/"
 
 echo "==> done. The app now spawns $PY automatically; 'pnpm tauri build' bundles it."
 echo "    NOTE: the relocatable mujoco native lib should be smoke-tested on a clean machine."

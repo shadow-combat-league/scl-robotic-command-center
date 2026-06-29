@@ -45,8 +45,12 @@ export interface RobotProfile {
   /** Current/active address — becomes the Wi-Fi IP after onboarding. */
   ip: string;
   sshUser: string;
+  /** SSH password, stored to allow hassle-free reconnect / re-Wi-Fi (operator's choice). */
+  sshPassword?: string;
   /** Wi-Fi network the robot was joined to, if any. */
   wifiSsid: string | null;
+  /** Port the on-robot telemetry agent listens on (deployed during onboarding). */
+  apiPort?: number;
   createdAt: number;
 }
 
@@ -55,9 +59,19 @@ export interface Telemetry {
   battery: number; // 0–100 %
   temperature: number; // °C
   cpuLoad: number; // 0–100 %
+  /** Used memory %, from the on-robot agent (OS metric). */
+  memory?: number;
   uptimeSec: number;
   jointsOk: boolean;
   estop: boolean;
+  /** Robot's hostname, reported by the agent. */
+  hostname?: string;
+  /**
+   * Whether robot-specific fields (battery/temperature/jointsOk/estop) are live
+   * from the Unitree DDS. False when only OS metrics are available — the UI then
+   * renders those fields as "—".
+   */
+  robotStateAvailable?: boolean;
 }
 
 /** A Wi-Fi network discovered by the robot's radio. */

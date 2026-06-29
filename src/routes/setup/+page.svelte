@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { page } from "$app/stores";
   import PageHeader from "$lib/components/PageHeader.svelte";
   import Panel from "$lib/components/Panel.svelte";
   import Button from "$lib/components/Button.svelte";
@@ -12,11 +13,15 @@
   import { ROBOT_TYPES, robotTypeSpec } from "$lib/services/robotTypes";
   import { onboarding as flow, WIZARD_STEPS } from "$lib/services/onboarding.svelte";
 
-  // Each visit starts a fresh wizard. Nothing is saved until the final step,
-  // so abandoning onboarding leaves no profile behind.
+  // Fresh wizard each visit (nothing saved until the final step), unless
+  // ?reonboard=<id> — then re-run onboarding for an existing robot from the
+  // Ethernet step (e.g. its saved Wi-Fi IP stopped responding).
   onMount(() => {
     robot.load();
-    flow.reset();
+    const id = $page.url.searchParams.get("reonboard");
+    const existing = id ? robot.robots.find((r) => r.id === id) : null;
+    if (existing) flow.resumeReonboard(existing);
+    else flow.reset();
   });
 
   function barsFor(signal: number): number {
@@ -172,13 +177,23 @@
     <!-- ============================ STEP 4: WI-FI ============================ -->
     {:else if flow.step === "wifi"}
       <Panel title="Connect Robot to Wi-Fi" icon="wifi">
-        {#if flow.wifiMode === null}
+        {#if flow.wifiPhase === "working"}
+          <div class="busy">
+            <Spinner size={32} />
+            <h3>Connecting {flow.name} to “{flow.targetSsid}”</h3>
+            <p>
+              Configuring Wi-Fi over SSH and waiting for the robot to receive an
+              address. This can take up to a minute — keep the Ethernet cable
+              connected.
+            </p>
+          </div>
+        {:else if flow.wifiMode === null}
           <p class="lead">Choose how the robot should join a wireless network.</p>
           <div class="wifi-modes">
             <button class="mode-card" onclick={() => flow.chooseWifiMode("computer")}>
               <span class="mode-icon"><Icon name="monitor" size={22} /></span>
               <span class="mode-title">Use this computer's network</span>
-              <span class="mode-desc">Join <strong>{flow.computerSsid}</strong>, the network this computer is on.</span>
+              <span class="mode-desc">Put the robot on the same Wi-Fi network this computer is using.</span>
             </button>
             <button class="mode-card" onclick={() => flow.chooseWifiMode("scan")}>
               <span class="mode-icon"><Icon name="wifi" size={22} /></span>
@@ -201,7 +216,14 @@
                 <Button variant="primary" icon="wifi" onclick={() => flow.scanWifi()}>Scan Networks</Button>
               </div>
             {:else if flow.wifiScanPhase === "working"}
-              <div class="result working"><Spinner /> Asking robot for nearby networks…</div>
+              <div class="busy">
+                <Spinner size={32} />
+                <h3>Scanning for networks</h3>
+                <p>Asking {flow.name} to list the Wi-Fi networks it can see. This takes a few seconds.</p>
+              </div>
+            {:else if flow.wifiScanPhase === "error"}
+              <div class="result error"><Icon name="alert" size={16} /> {flow.wifiMsg}</div>
+              <button class="link-btn rescan" onclick={() => flow.scanWifi()}>Try again</button>
             {:else}
               <ul class="wifi-list">
                 {#each flow.wifiList as net (net.ssid)}
@@ -227,6 +249,18 @@
             {/if}
           {/if}
 
+          {#if flow.wifiMode === "computer"}
+            {#if flow.hostSsidPhase === "working"}
+              <div class="busy">
+                <Spinner size={32} />
+                <h3>Detecting this computer's network</h3>
+                <p>Reading the Wi-Fi network this computer is connected to…</p>
+              </div>
+            {:else if flow.hostSsidPhase === "error"}
+              <div class="result error"><Icon name="alert" size={16} /> {flow.wifiMsg}</div>
+            {/if}
+          {/if}
+
           <!-- selected network → password + connect -->
           {#if flow.targetSsid}
             <div class="selected-net">
@@ -234,15 +268,18 @@
               <span class="mono">{flow.targetSsid}</span>
             </div>
             <div class="form">
-              <Field label="Wi-Fi password" hint="The password the robot will use to join this network.">
+              <Field
+                label="Wi-Fi password"
+                hint={flow.wifiMode === "computer" && flow.wifiPassword
+                  ? "Filled in from this computer's saved network — edit if needed."
+                  : "The password the robot will use to join this network."}
+              >
                 <input type="password" placeholder="••••••••" bind:value={flow.wifiPassword} />
               </Field>
             </div>
           {/if}
 
-          {#if flow.wifiPhase === "working"}
-            <div class="result working"><Spinner /> Joining {flow.targetSsid}…</div>
-          {:else if flow.wifiPhase === "ok"}
+          {#if flow.wifiPhase === "ok"}
             <div class="result ok">
               <Icon name="check" size={16} /> {flow.wifiMsg} · new address <strong class="mono">{flow.newIp}</strong>
             </div>
@@ -251,26 +288,63 @@
           {/if}
         {/if}
 
-        <footer class="actions">
-          <Button variant="ghost" icon="arrowLeft" onclick={() => (flow.step = "ssh")}>Back</Button>
-          <div class="spacer"></div>
-          {#if flow.wifiMode !== null && flow.targetSsid && flow.wifiPhase !== "ok"}
-            <Button
-              variant="primary"
-              icon="wifi"
-              disabled={flow.wifiPhase === "working"}
-              onclick={() => flow.connectWifi()}
-            >
-              Connect
-            </Button>
-          {/if}
-          {#if flow.wifiPhase === "ok"}
-            <Button variant="primary" icon="check" onclick={() => flow.finish()}>Finish & Save</Button>
-          {/if}
-        </footer>
+        {#if flow.wifiPhase !== "working"}
+          <footer class="actions">
+            <Button variant="ghost" icon="arrowLeft" onclick={() => (flow.step = "ssh")}>Back</Button>
+            <div class="spacer"></div>
+            {#if flow.wifiMode !== null && flow.targetSsid && flow.wifiPhase !== "ok"}
+              <Button variant="primary" icon="wifi" onclick={() => flow.connectWifi()}>Connect</Button>
+            {/if}
+            {#if flow.wifiPhase === "ok"}
+              <Button variant="primary" icon="chevronRight" onclick={() => flow.goToProvision()}>Continue</Button>
+            {/if}
+          </footer>
+        {/if}
       </Panel>
 
-    <!-- ============================ STEP 5: DONE ============================ -->
+    <!-- ============================ STEP 5: PROVISION ============================ -->
+    {:else if flow.step === "provision"}
+      <Panel title="Deploy Telemetry Agent" icon="setup">
+        {#if flow.provisionPhase === "working"}
+          <div class="busy">
+            <Spinner size={32} />
+            <h3>Deploying telemetry agent to {flow.name}</h3>
+            <p>
+              Uploading the agent over SSH and registering it as a startup service
+              so it runs whenever the robot is powered on. This takes a few seconds.
+            </p>
+          </div>
+        {:else}
+          <p class="lead">
+            The command center installs a small service on <strong>{flow.name}</strong> that
+            reports live telemetry (battery, temperature, CPU, joints) to this dashboard on
+            port <span class="mono">{flow.agentPort}</span>.
+          </p>
+
+          {#if flow.provisionPhase === "ok"}
+            <div class="result ok"><Icon name="check" size={16} /> {flow.provisionMsg}</div>
+          {:else if flow.provisionPhase === "error"}
+            <div class="result error"><Icon name="alert" size={16} /> {flow.provisionMsg}</div>
+          {/if}
+        {/if}
+
+        {#if flow.provisionPhase !== "working"}
+          <footer class="actions">
+            <Button variant="ghost" icon="arrowLeft" onclick={() => (flow.step = "wifi")}>Back</Button>
+            <div class="spacer"></div>
+            {#if flow.provisionPhase === "error"}
+              <Button variant="ghost" onclick={() => flow.skipProvision()}>Skip for now</Button>
+              <Button variant="primary" icon="setup" onclick={() => flow.provisionAgent()}>Retry</Button>
+            {:else if flow.provisionPhase === "ok"}
+              <Button variant="primary" icon="check" onclick={() => flow.finish()}>Finish & Save</Button>
+            {:else}
+              <Button variant="primary" icon="setup" onclick={() => flow.provisionAgent()}>Deploy Agent</Button>
+            {/if}
+          </footer>
+        {/if}
+      </Panel>
+
+    <!-- ============================ STEP 6: DONE ============================ -->
     {:else if flow.step === "done"}
       <Panel title="Setup Complete" icon="check">
         <div class="done">
@@ -283,6 +357,10 @@
             <div><dt>Type</dt><dd>{flow.type ? robotTypeSpec(flow.type).name : "—"}</dd></div>
             <div><dt>Wi-Fi</dt><dd>{flow.targetSsid ?? "—"}</dd></div>
             <div><dt>Address</dt><dd class="mono">{flow.newIp}</dd></div>
+            <div>
+              <dt>Telemetry</dt>
+              <dd class="mono">{flow.provisionPhase === "ok" ? `agent :${flow.agentPort}` : "not deployed"}</dd>
+            </div>
           </dl>
 
           <div class="done-actions">
@@ -395,6 +473,18 @@
   }
   .result strong { font-weight: 700; }
   .result.working { color: var(--text-secondary); background: var(--bg-elev-2); border-color: var(--border-strong); }
+
+  /* full-panel loading screen (long Wi-Fi connect) */
+  .busy {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 15px;
+    padding: 44px 16px 36px;
+  }
+  .busy h3 { font-size: 16px; font-weight: 650; color: var(--text-primary); }
+  .busy p { color: var(--text-muted); font-size: 13px; max-width: 42ch; line-height: 1.55; }
   .result.ok { color: var(--green-bright); background: var(--green-tint); border-color: color-mix(in srgb, var(--green) 45%, transparent); }
   .result.error { color: var(--red-bright); background: var(--red-tint); border-color: color-mix(in srgb, var(--red) 45%, transparent); }
 
@@ -433,7 +523,6 @@
   }
   .mode-title { font-weight: 650; font-size: 13.5px; color: var(--text-primary); }
   .mode-desc { font-size: 12px; color: var(--text-muted); }
-  .mode-desc strong { color: var(--text-secondary); }
 
   .wifi-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
   .link-btn {

@@ -8,6 +8,11 @@ use std::time::Duration;
 use tauri::path::BaseDirectory;
 use tauri::Manager;
 
+/// Live on-disk bundle on the dev machine. `tauri dev` serves a Resource copy
+/// that can be STALE (not re-synced on rebuild), so prefer this when it exists.
+/// Absent on end-user machines → falls back to the packaged Resource bundle.
+const DEV_RES: &str = "/home/victor/SCL/scl-robotic-command-center/src-tauri/resources";
+
 /// Holds the currently-running motion-preview backend process (if any).
 #[derive(Default)]
 struct PreviewState(Mutex<Option<Child>>);
@@ -49,18 +54,23 @@ struct PreviewPaths {
     gmr_root: Option<String>,
 }
 
-/// Prefer the self-contained Python env bundled in app resources; fall back to a
-/// dev interpreter (env var / the unitree-rl conda env) when it isn't present.
+/// Resolve the python interpreter + scripts. Dev prefers the live on-disk bundle
+/// (DEV_RES); packaged uses the Resource bundle; otherwise a dev/system fallback.
 fn resolve_paths(app: &tauri::AppHandle) -> PreviewPaths {
+    if std::path::Path::new(DEV_RES).join("pyenv/bin/python").exists() {
+        return PreviewPaths {
+            python: format!("{DEV_RES}/pyenv/bin/python"),
+            script: format!("{DEV_RES}/meshcat_preview/meshcat_motion_preview.py"),
+            gmr_root: Some(format!("{DEV_RES}/GMR")),
+        };
+    }
     let res = |rel: &str| {
         app.path()
             .resolve(rel, BaseDirectory::Resource)
             .ok()
             .filter(|p| p.exists())
     };
-
     if let Some(python) = res("resources/pyenv/bin/python") {
-        // Packaged: fully embedded, nothing required on the user's machine.
         return PreviewPaths {
             python: p2s(python),
             script: res("resources/meshcat_preview/meshcat_motion_preview.py")
@@ -69,21 +79,6 @@ fn resolve_paths(app: &tauri::AppHandle) -> PreviewPaths {
             gmr_root: res("resources/GMR").map(p2s),
         };
     }
-
-    // `tauri dev` doesn't expose bundled resources via BaseDirectory::Resource,
-    // so use the built bundle on disk directly when it's present.
-    const DEV_RES: &str =
-        "/home/victor/SCL/scl-robotic-command-center/src-tauri/resources";
-    let dev_python = std::path::Path::new(DEV_RES).join("pyenv/bin/python");
-    if dev_python.exists() {
-        return PreviewPaths {
-            python: p2s(dev_python),
-            script: format!("{DEV_RES}/meshcat_preview/meshcat_motion_preview.py"),
-            gmr_root: Some(format!("{DEV_RES}/GMR")),
-        };
-    }
-
-    // Last resort: a Python you have installed.
     PreviewPaths {
         python: std::env::var("SCL_PREVIEW_PYTHON")
             .unwrap_or_else(|_| "/home/victor/miniconda3/envs/unitree-rl/bin/python".into()),
@@ -92,6 +87,129 @@ fn resolve_paths(app: &tauri::AppHandle) -> PreviewPaths {
         }),
         gmr_root: std::env::var("SCL_GMR_ROOT").ok(),
     }
+}
+
+/// (python interpreter, scripts-root dir). Bundled env if present, else the
+/// repo's `tools/` as a dev fallback.
+fn python_env(app: &tauri::AppHandle) -> (String, String) {
+    if std::path::Path::new(DEV_RES).join("pyenv/bin/python").exists() {
+        return (format!("{DEV_RES}/pyenv/bin/python"), DEV_RES.to_string());
+    }
+    if let Some(py) = app
+        .path()
+        .resolve("resources/pyenv/bin/python", BaseDirectory::Resource)
+        .ok()
+        .filter(|p| p.exists())
+    {
+        let root = app
+            .path()
+            .resolve("resources", BaseDirectory::Resource)
+            .map(p2s)
+            .unwrap_or_default();
+        return (p2s(py), root);
+    }
+    (
+        std::env::var("SCL_PREVIEW_PYTHON")
+            .unwrap_or_else(|_| "/home/victor/miniconda3/envs/unitree-rl/bin/python".into()),
+        "/home/victor/SCL/scl-robotic-command-center/tools".to_string(),
+    )
+}
+
+/// Blocking implementation of an onboarding action. Runs on a worker thread
+/// (see `run_onboard`) so the long SSH/nmcli work never blocks the UI thread.
+fn run_onboard_blocking(
+    app: &tauri::AppHandle,
+    action: &str,
+    host: &str,
+    user: &str,
+    ssid: &str,
+    ssh_password: &str,
+    wifi_password: &str,
+    agent_port: u16,
+) -> Result<String, String> {
+    let (python, root) = python_env(app);
+    // Resolve onboard.py by first-existing candidate — the bundled root may lag
+    // behind the live source on a dev machine.
+    let script = [
+        format!("{root}/robot_onboard/onboard.py"),
+        format!("{DEV_RES}/robot_onboard/onboard.py"),
+        "/home/victor/SCL/scl-robotic-command-center/tools/robot_onboard/onboard.py".to_string(),
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .ok_or("onboard.py not found in bundle or tools/")?;
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script).arg(action);
+    if !host.is_empty() {
+        cmd.arg("--host").arg(host);
+    }
+    if !user.is_empty() {
+        cmd.arg("--user").arg(user);
+    }
+    if !ssid.is_empty() {
+        cmd.arg("--ssid").arg(ssid);
+    }
+    // Provisioning ships the bundled telemetry agent's source to the robot via
+    // an env var (read by onboard.py's `provision` subcommand).
+    if action == "provision" {
+        cmd.arg("--agent-port").arg(agent_port.to_string());
+        let agent = [
+            format!("{root}/robot_agent/agent.py"),
+            format!("{DEV_RES}/robot_agent/agent.py"),
+            "/home/victor/SCL/scl-robotic-command-center/tools/robot_agent/agent.py".to_string(),
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .ok_or("agent.py not found in bundle or tools/")?;
+        let content = std::fs::read_to_string(&agent)
+            .map_err(|e| format!("could not read agent.py ('{agent}'): {e}"))?;
+        cmd.env("SCL_ROBOT_AGENT_CONTENT", content);
+    }
+    cmd.env("SCL_SSH_PASSWORD", ssh_password)
+        .env("SCL_WIFI_PASSWORD", wifi_password)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = cmd
+        .output()
+        .map_err(|e| format!("onboard backend failed to start ('{python}'): {e}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "onboard backend produced no output".into()
+        } else {
+            format!("onboard backend error: {stderr}")
+        });
+    }
+    Ok(stdout)
+}
+
+/// Run an onboarding action (reachable / ssh-check / scan / connect / host-ssid)
+/// against the robot via the bundled python; returns the backend's JSON line.
+/// Secrets are passed via env (not argv) so they don't show in process lists.
+///
+/// `async` + `spawn_blocking` so the SSH/nmcli round-trip (up to ~70s) runs OFF
+/// the main thread — otherwise it freezes the webview and the UI's loading state
+/// never paints.
+#[tauri::command]
+async fn run_onboard(
+    app: tauri::AppHandle,
+    action: String,
+    host: String,
+    user: String,
+    ssid: String,
+    ssh_password: String,
+    wifi_password: String,
+    agent_port: Option<u16>,
+) -> Result<String, String> {
+    let agent_port = agent_port.unwrap_or(8472);
+    tauri::async_runtime::spawn_blocking(move || {
+        run_onboard_blocking(
+            &app, &action, &host, &user, &ssid, &ssh_password, &wifi_password, agent_port,
+        )
+    })
+    .await
+    .map_err(|e| format!("onboard task failed: {e}"))?
 }
 
 /// Spawn the Meshcat motion-preview backend, wait for `MESHCAT_URL=...`, return it.
@@ -246,11 +364,13 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_http::init())
         .manage(PreviewState::default())
         .invoke_handler(tauri::generate_handler![
             start_motion_preview,
             stop_motion_preview,
             control_motion_preview,
+            run_onboard,
             save_library_file,
             delete_library_file
         ])
