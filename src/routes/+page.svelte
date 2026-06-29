@@ -54,7 +54,7 @@
     <div class="empty-types">
       <span class="label">Supported</span>
       <span class="chip">Unitree G1</span>
-      <span class="chip">EngineAI T800</span>
+      <span class="chip soon">EngineAI T800 · Coming soon</span>
     </div>
   </div>
 {:else}
@@ -201,6 +201,7 @@
   .empty p { color: var(--text-secondary); font-size: 14px; }
   .empty-types { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
   .chip { font-family: var(--font-mono); font-size: 11.5px; letter-spacing: 0.06em; color: var(--text-secondary); padding: 4px 10px; border: 1px solid var(--border-strong); border-radius: var(--r-pill); background: var(--bg-elev-2); }
+  .chip.soon { color: var(--text-faint); border-style: dashed; }
 
   /* --- quick actions --- */
   .quick { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-bottom: 22px; }

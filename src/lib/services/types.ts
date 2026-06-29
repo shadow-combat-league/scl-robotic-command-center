@@ -31,6 +31,8 @@ export interface RobotTypeSpec {
   defaultSshUser: string;
   /** Optional caveat shown next to editable defaults that aren't confirmed. */
   note?: string;
+  /** Temporarily unavailable — shown as "Coming soon" and not selectable. */
+  comingSoon?: boolean;
 }
 
 /** A robot the operator has created a profile for. */

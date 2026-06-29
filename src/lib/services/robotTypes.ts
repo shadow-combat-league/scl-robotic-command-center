@@ -21,6 +21,7 @@ export const ROBOT_TYPES: RobotTypeSpec[] = [
     defaultEthernetIp: "192.168.1.100",
     defaultSshUser: "root",
     note: "Default IP unconfirmed — verify the T800's wired address before scanning.",
+    comingSoon: true, // temporarily disabled across the app
   },
 ];
 

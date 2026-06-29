@@ -109,8 +109,9 @@ class OnboardingFlow {
   }
 
   chooseType(type: RobotType): void {
-    this.type = type;
     const spec = robotTypeSpec(type);
+    if (spec.comingSoon) return; // not yet selectable
+    this.type = type;
     this.ethernetIp = spec.defaultEthernetIp;
     this.sshUser = spec.defaultSshUser;
   }

@@ -53,12 +53,16 @@
                 <button
                   class="type-card"
                   class:selected={flow.type === t.id}
+                  class:soon={t.comingSoon}
+                  disabled={t.comingSoon}
                   onclick={() => flow.chooseType(t.id)}
                 >
                   <span class="type-icon"><Icon name="robot" size={22} /></span>
                   <span class="type-name">{t.name}</span>
                   <span class="type-vendor">{t.vendor}</span>
-                  {#if flow.type === t.id}
+                  {#if t.comingSoon}
+                    <span class="type-soon">Coming soon</span>
+                  {:else if flow.type === t.id}
                     <span class="type-check"><Icon name="check" size={13} /></span>
                   {/if}
                 </button>
@@ -353,6 +357,28 @@
     border-radius: 50%;
     background: var(--gold);
     color: #1a1405;
+  }
+  .type-card.soon {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .type-card.soon:hover {
+    border-color: var(--border-strong);
+  }
+  .type-soon {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--gold);
+    background: var(--gold-tint);
+    border: 1px solid color-mix(in srgb, var(--gold) 35%, transparent);
+    padding: 3px 7px;
+    border-radius: var(--r-pill);
   }
 
   /* result banners */

@@ -39,6 +39,7 @@
     input.value = "";
   }
   function choosePolicyRobot(robot: RobotType) {
+    if (ROBOT_TYPES.find((r) => r.id === robot)?.comingSoon) return; // not yet available
     if (pendingPolicyFile) library.importPolicy(pendingPolicyFile, robot);
     pendingPolicyFile = null;
   }
@@ -71,70 +72,80 @@
 
 {#if library.previewKind === "motion" && mtn}
   <!-- ===================== MOTION PREVIEW (Meshcat) ===================== -->
-  <PageHeader eyebrow="Motion Preview" title={mtn.name} subtitle="Live retarget preview, streamed from Meshcat.">
-    {#snippet actions()}
-      <div class="seg">
-        {#each ROBOT_TYPES as t (t.id)}
-          <button class="seg-btn" class:active={library.previewRobot === t.id} onclick={() => library.setModel(t.id)}>{t.name}</button>
-        {/each}
-      </div>
-      <Button variant="ghost" size="sm" icon="arrowLeft" onclick={() => library.closePreview()}>Library</Button>
-    {/snippet}
-  </PageHeader>
+  <div class="preview">
+    <PageHeader eyebrow="Motion Preview" title={mtn.name} subtitle="Live retarget preview, streamed from Meshcat.">
+      {#snippet actions()}
+        <div class="seg">
+          {#each ROBOT_TYPES as t (t.id)}
+            <button
+              class="seg-btn"
+              class:active={library.previewRobot === t.id}
+              disabled={t.comingSoon}
+              title={t.comingSoon ? "Coming soon" : null}
+              onclick={() => library.setModel(t.id)}
+            >{t.name}{#if t.comingSoon} · soon{/if}</button>
+          {/each}
+        </div>
+        <Button variant="ghost" size="sm" icon="arrowLeft" onclick={() => library.closePreview()}>Library</Button>
+      {/snippet}
+    </PageHeader>
 
-  <div class="meta-row">
-    {#if mtn.frames > 0}
-      <span class="chip mono"><Icon name="file" size={13} /> {mtn.frames} frames</span>
-      <span class="chip mono">{fmtTime(mtn.durationSec)} @ {mtn.fps}fps</span>
-      <span class="chip mono">{mtn.columns} DoF</span>
-    {:else}
-      <span class="chip mono"><Icon name="cube" size={13} /> {robotName(library.previewRobot)} · Meshcat</span>
+    <div class="meta-row">
+      {#if mtn.frames > 0}
+        <span class="chip mono"><Icon name="file" size={13} /> {mtn.frames} frames</span>
+        <span class="chip mono">{fmtTime(mtn.durationSec)} @ {mtn.fps}fps</span>
+        <span class="chip mono">{mtn.columns} DoF</span>
+      {:else}
+        <span class="chip mono"><Icon name="cube" size={13} /> {robotName(library.previewRobot)} · Meshcat</span>
+      {/if}
+    </div>
+
+    {#if library.previewState === "loading"}
+      <div class="loading-pane fill"><Spinner size={22} /> Loading {robotName(library.previewRobot)} model & retargeting motion…</div>
+    {:else if library.previewState === "error"}
+      <div class="loading-pane fill err"><Icon name="alert" size={20} /> {library.importError || "Preview failed to start."}</div>
+    {:else if library.previewState === "ready"}
+      <StreamView fill title="3D Motion Preview" url={library.previewUrl} name={mtn.name} stopLabel="Close preview" onStop={() => library.closePreview()} />
+      {#if mtn.frames > 0}
+        <div class="transport">
+          <button class="play" onclick={() => library.togglePlay()} aria-label={library.playing ? "Pause" : "Play"}>
+            <Icon name={library.playing ? "pause" : "play"} size={16} />
+          </button>
+          <span class="time mono">{fmtTime(curTime)}</span>
+          <input class="scrub" type="range" min="0" max={mtn.frames - 1} value={library.frame} oninput={(e) => library.seek(Number((e.currentTarget as HTMLInputElement).value))} />
+          <span class="time mono">{fmtTime(mtn.durationSec)}</span>
+          <div class="seg">
+            {#each [0.5, 1, 2] as s (s)}
+              <button class="seg-btn" class:active={library.speed === s} onclick={() => library.setSpeed(s)}>{s}×</button>
+            {/each}
+          </div>
+        </div>
+      {/if}
     {/if}
   </div>
-
-  {#if library.previewState === "loading"}
-    <div class="loading-pane"><Spinner size={22} /> Loading {robotName(library.previewRobot)} model & retargeting motion…</div>
-  {:else if library.previewState === "error"}
-    <div class="loading-pane err"><Icon name="alert" size={20} /> {library.importError || "Preview failed to start."}</div>
-  {:else if library.previewState === "ready"}
-    <StreamView title="3D Motion Preview" url={library.previewUrl} name={mtn.name} stopLabel="Close preview" onStop={() => library.closePreview()} />
-    {#if mtn.frames > 0}
-    <div class="transport">
-      <button class="play" onclick={() => library.togglePlay()} aria-label={library.playing ? "Pause" : "Play"}>
-        <Icon name={library.playing ? "pause" : "play"} size={16} />
-      </button>
-      <span class="time mono">{fmtTime(curTime)}</span>
-      <input class="scrub" type="range" min="0" max={mtn.frames - 1} value={library.frame} oninput={(e) => library.seek(Number((e.currentTarget as HTMLInputElement).value))} />
-      <span class="time mono">{fmtTime(mtn.durationSec)}</span>
-      <div class="seg">
-        {#each [0.5, 1, 2] as s (s)}
-          <button class="seg-btn" class:active={library.speed === s} onclick={() => library.setSpeed(s)}>{s}×</button>
-        {/each}
-      </div>
-    </div>
-    {/if}
-  {/if}
 
 {:else if library.previewKind === "policy" && pol}
   <!-- ===================== POLICY PREVIEW (Isaac Lab) ===================== -->
-  <PageHeader eyebrow="Policy Preview" title={pol.name} subtitle="Reinforcement-learning policy rollout in Isaac Lab.">
-    {#snippet actions()}
-      <StatusPill tone="gold" dot={false}>{robotName(pol.robot)}</StatusPill>
-      <Button variant="ghost" size="sm" icon="arrowLeft" onclick={() => library.closePreview()}>Library</Button>
-    {/snippet}
-  </PageHeader>
+  <div class="preview">
+    <PageHeader eyebrow="Policy Preview" title={pol.name} subtitle="Reinforcement-learning policy rollout in Isaac Lab.">
+      {#snippet actions()}
+        <StatusPill tone="gold" dot={false}>{robotName(pol.robot)}</StatusPill>
+        <Button variant="ghost" size="sm" icon="arrowLeft" onclick={() => library.closePreview()}>Library</Button>
+      {/snippet}
+    </PageHeader>
 
-  <div class="meta-row">
-    <span class="chip mono"><Icon name="cpu" size={13} /> {robotName(pol.robot)}</span>
-    <span class="chip mono">{fmtSize(pol.sizeKb)}</span>
-    <span class="chip mono">ONNX</span>
+    <div class="meta-row">
+      <span class="chip mono"><Icon name="cpu" size={13} /> {robotName(pol.robot)}</span>
+      <span class="chip mono">{fmtSize(pol.sizeKb)}</span>
+      <span class="chip mono">ONNX</span>
+    </div>
+
+    {#if library.previewState === "loading"}
+      <div class="loading-pane fill"><Spinner size={22} /> Starting Isaac Lab & loading policy onto {robotName(pol.robot)}…</div>
+    {:else if library.previewState === "ready"}
+      <StreamView fill title="Isaac Lab · Policy Rollout" url={library.previewUrl} name={pol.name} stopLabel="Stop rollout" onStop={() => library.closePreview()} />
+    {/if}
   </div>
-
-  {#if library.previewState === "loading"}
-    <div class="loading-pane"><Spinner size={22} /> Starting Isaac Lab & loading policy onto {robotName(pol.robot)}…</div>
-  {:else if library.previewState === "ready"}
-    <StreamView title="Isaac Lab · Policy Rollout" url={library.previewUrl} name={pol.name} stopLabel="Stop rollout" onStop={() => library.closePreview()} />
-  {/if}
 
 {:else}
   <!-- ===================== LIBRARY ===================== -->
@@ -215,10 +226,10 @@
       <p class="dlg-sub">Choose the model <strong>{pendingPolicyFile.name}</strong> was trained for. It determines the embodiment Isaac Lab loads for the rollout.</p>
       <div class="choices">
         {#each ROBOT_TYPES as t (t.id)}
-          <button class="choice" onclick={() => choosePolicyRobot(t.id)}>
+          <button class="choice" class:soon={t.comingSoon} disabled={t.comingSoon} onclick={() => choosePolicyRobot(t.id)}>
             <span class="choice-icon"><Icon name="robot" size={22} /></span>
             <span class="choice-name">{t.name}</span>
-            <span class="choice-vendor">{t.vendor}</span>
+            <span class="choice-vendor">{t.comingSoon ? "Coming soon" : t.vendor}</span>
           </button>
         {/each}
       </div>
@@ -235,12 +246,17 @@
   .seg-btn { font-family: var(--font-mono); font-weight: 600; letter-spacing: 0.04em; font-size: 11px; padding: 6px 11px; background: transparent; border: none; border-radius: var(--r-sm); color: var(--text-secondary); transition: all var(--transition); }
   .seg-btn:hover { color: var(--text-primary); }
   .seg-btn.active { background: var(--gold-tint); color: var(--gold-bright); }
+  .seg-btn:disabled { opacity: 0.4; cursor: default; }
+  .seg-btn:disabled:hover { color: var(--text-secondary); }
 
   .meta-row { display: flex; gap: 9px; margin-bottom: 16px; }
   .chip { display: inline-flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--text-secondary); padding: 5px 11px; border: 1px solid var(--border-strong); border-radius: var(--r-pill); background: var(--bg-elev-2); }
   .chip :global(svg) { color: var(--gold); }
 
+  /* preview fills the content area's vertical space */
+  .preview { height: 100%; display: flex; flex-direction: column; min-height: 0; }
   .loading-pane { display: flex; align-items: center; justify-content: center; gap: 12px; min-height: 340px; border: 1px dashed var(--border-strong); border-radius: var(--r-md); background: var(--bg-base); font-family: var(--font-mono); font-size: 13px; color: var(--text-secondary); }
+  .loading-pane.fill { flex: 1; }
   .loading-pane.err { color: var(--red-bright); border-color: color-mix(in srgb, var(--red) 45%, transparent); }
   .loading-pane.err :global(svg) { color: var(--red-bright); }
 
@@ -284,6 +300,8 @@
   .dlg-sub strong { color: var(--text-primary); }
   .choices { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 18px 0 4px; }
   .choice { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; padding: 16px; background: var(--bg-elev-2); border: 1px solid var(--border-strong); border-radius: var(--r-md); text-align: left; transition: all var(--transition); }
+  .choice.soon { opacity: 0.5; cursor: default; }
+  .choice.soon:hover { border-color: var(--border-strong); background: var(--bg-elev-2); }
   .choice:hover { border-color: var(--gold); background: var(--gold-tint); }
   .choice-icon { color: var(--gold); margin-bottom: 4px; }
   .choice-name { font-weight: 650; font-size: 14px; color: var(--text-primary); }
