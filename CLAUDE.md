@@ -27,7 +27,7 @@ Don't launch `pnpm tauri dev` to "verify" routine changes — it needs the Rust 
 - **Components** are small and presentational; pass callbacks (`onStop`, `onDelete`, `onConfirm`) and data in via props/snippets. Reuse existing primitives: `Button`, `Panel`, `PageHeader`, `StatusPill`, `Icon`, `Field`, `Spinner`, `Stepper`, `ConfirmDialog`, `StreamView`, `RobotCard`.
 - **Icons** are inline SVG paths in `components/Icon.svelte` (`ICONS` map) — add a new entry there rather than importing an icon lib.
 - **No account system.** No login/users/roles. Don't reintroduce "Admin"/sign-in concepts; device config lives under **Settings**.
-- **Routing:** SvelteKit file routes. `/setup` (onboarding) is intentionally chrome-light — the **sidebar is hidden** when there are no robots and on `/setup`; it's reached via "Add Robot" buttons, not a nav item.
+- **Navigation:** primary nav is a floating **command dock** at the bottom-center (`components/Dock.svelte`), not a left sidebar. It shows only once a robot exists and **never on `/setup`** (onboarding is chrome-light, reached via "Add Robot" buttons). `components/TopBar.svelte` is the slim top strip (SCL mark + live fleet status + ALL-STOP). Content is full-width; `.content.has-dock` pads the bottom to clear the floating dock.
 - Avoid `Date.now()`/`Math.random()` only inside Workflow scripts (a sandbox limitation) — they're fine in normal app code here.
 
 ## Domain notes
