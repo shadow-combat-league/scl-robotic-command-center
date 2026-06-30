@@ -13,7 +13,17 @@
 
 import { db } from "./db";
 import { robotTypeSpec } from "./robotTypes";
-import { isTauri, robotReachable, fetchTelemetry, robotCommand } from "./tauri";
+import {
+  isTauri,
+  robotReachable,
+  fetchTelemetry,
+  robotCommand,
+  startMotionPlayback,
+  controlMotionPlayback,
+  stopMotionPlayback,
+  robotBridgeStart,
+  robotBridgeStop,
+} from "./tauri";
 import type {
   ActivityEvent,
   ConnectionState,
@@ -280,20 +290,85 @@ class RobotService {
     this.#log("info", `${name}: ${posture}`);
   }
 
-  /** Play a motion on the given (online) robots. MOCK — logs to the activity feed. */
-  playMotionOn(ids: string[], motionName: string): void {
+  /**
+   * Stream a motion onto the given (online) robots via the on-robot playback
+   * pipeline (real in the desktop app; logged-only in the browser). Per robot:
+   * spawn playback → ramp into frame 0 → play.
+   */
+  async playMotionOn(
+    ids: string[],
+    motionName: string,
+    motionPath?: string,
+  ): Promise<Record<string, { ok: boolean; error?: string }>> {
+    const results: Record<string, { ok: boolean; error?: string }> = {};
     for (const id of ids) {
-      if (!this.isOnline(id)) continue;
-      const name = this.robots.find((r) => r.id === id)?.name ?? "robot";
-      this.#log("success", `${name}: playing motion “${motionName}”`);
+      const r = this.robots.find((x) => x.id === id);
+      if (!r || !this.isOnline(id)) {
+        results[id] = { ok: false, error: "robot offline" };
+        continue;
+      }
+      if (isTauri() && motionPath) {
+        this.cmdState[id] = { action: "play motion", phase: "sending", msg: motionName };
+        try {
+          // The dds_bridge must be running on the robot before the PC connects.
+          await robotBridgeStart(r.ip, r.sshUser, r.sshPassword ?? "");
+          await startMotionPlayback(id, motionPath, r.ip, false);
+          await controlMotionPlayback(id, "start"); // ramp into frame 0, then hold (armed)
+          this.cmdState[id] = { action: "play motion", phase: "ok", msg: `armed: ${motionName}` };
+          this.#log("success", `${r.name}: motion “${motionName}” armed (press Play)`);
+          results[id] = { ok: true };
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          this.cmdState[id] = { action: "play motion", phase: "error", msg };
+          this.#log("error", `${r.name}: motion playback failed — ${msg}`);
+          results[id] = { ok: false, error: msg };
+        }
+      } else {
+        this.#log("success", `${r.name}: playing motion “${motionName}”`);
+        results[id] = { ok: true };
+      }
+    }
+    return results;
+  }
+
+  /** Stop motion playback on the given robots (returns them to FSM 801) + bridge. */
+  async stopMotionOn(ids: string[], motionName: string): Promise<void> {
+    for (const id of ids) {
+      const r = this.robots.find((x) => x.id === id);
+      const name = r?.name ?? "robot";
+      if (isTauri()) {
+        try {
+          await stopMotionPlayback(id);
+          if (r) await robotBridgeStop(r.ip, r.sshUser, r.sshPassword ?? "");
+        } catch {
+          /* best-effort */
+        }
+      }
+      this.#log("info", `${name}: stopped motion “${motionName}”`);
     }
   }
 
-  /** Stop a playing motion on the given robots. MOCK — logs to the activity feed. */
-  stopMotionOn(ids: string[], motionName: string): void {
+  /** Pause/resume motion playback on the given robots. */
+  async setMotionPaused(ids: string[], paused: boolean): Promise<void> {
+    if (!isTauri()) return;
     for (const id of ids) {
-      const name = this.robots.find((r) => r.id === id)?.name ?? "robot";
-      this.#log("info", `${name}: stopped motion “${motionName}”`);
+      try {
+        await controlMotionPlayback(id, paused ? "pause" : "play");
+      } catch {
+        /* best-effort */
+      }
+    }
+  }
+
+  /** Toggle looping on the given robots' playback. */
+  async setMotionLoop(ids: string[], loop: boolean): Promise<void> {
+    if (!isTauri()) return;
+    for (const id of ids) {
+      try {
+        await controlMotionPlayback(id, loop ? "loop on" : "loop off");
+      } catch {
+        /* best-effort */
+      }
     }
   }
 

@@ -1,11 +1,13 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
 use tauri::path::BaseDirectory;
+use tauri::Emitter;
 use tauri::Manager;
 
 /// Live on-disk bundle on the dev machine. `tauri dev` serves a Resource copy
@@ -359,6 +361,182 @@ fn delete_library_file(app: tauri::AppHandle, path: String) -> Result<(), String
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// On-robot motion playback: stream a G1 qpos CSV through the bundled 3.10 env +
+// SecureMotionInferencer to dds_bridge_nx.py on the robot. One process per robot
+// id, controlled over the child's stdin (start/play/pause/reset/stop/quit).
+// ---------------------------------------------------------------------------
+struct PlaybackProc {
+    child: Child,
+    stdin: ChildStdin,
+}
+
+#[derive(Default)]
+struct PlaybackState(Mutex<HashMap<String, PlaybackProc>>);
+
+/// A line from a robot's playback backend, forwarded to the frontend.
+/// `kind` is the first token (STATUS | EVENT | ERROR | PLAYBACK_READY | EXIT),
+/// `data` the remainder (STATUS carries a JSON blob).
+#[derive(Clone, serde::Serialize)]
+struct PlaybackEvent {
+    id: String,
+    kind: String,
+    data: String,
+}
+
+/// (python, motion_play.py, bundle dir) for the 3.10 playback env.
+fn resolve_playback(app: &tauri::AppHandle) -> Result<(String, String, String), String> {
+    if std::path::Path::new(DEV_RES).join("pyenv310/bin/python").exists() {
+        return Ok((
+            format!("{DEV_RES}/pyenv310/bin/python"),
+            format!("{DEV_RES}/motion_play/motion_play.py"),
+            format!("{DEV_RES}/motion_play"),
+        ));
+    }
+    let res = |rel: &str| {
+        app.path()
+            .resolve(rel, BaseDirectory::Resource)
+            .ok()
+            .filter(|p| p.exists())
+            .map(p2s)
+    };
+    match (
+        res("resources/pyenv310/bin/python"),
+        res("resources/motion_play/motion_play.py"),
+        res("resources/motion_play"),
+    ) {
+        (Some(py), Some(script), Some(bundle)) => Ok((py, script, bundle)),
+        _ => Err("motion playback env not bundled (run tools/motion_play/build_playback_env.sh)".into()),
+    }
+}
+
+fn kill_playback(state: &PlaybackState, id: &str) {
+    if let Some(mut proc) = state.0.lock().ok().and_then(|mut g| g.remove(id)) {
+        // Ask it to quit (restores FSM 801), then SIGTERM (the python handler
+        // also restores FSM 801), then force-kill as a fallback.
+        let _ = writeln!(proc.stdin, "quit");
+        let _ = proc.stdin.flush();
+        drop(proc.stdin);
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill").arg(proc.child.id().to_string()).status();
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let _ = proc.child.kill();
+        let _ = proc.child.wait();
+    }
+}
+
+/// Spawn motion playback for a robot; resolves once the backend prints
+/// `PLAYBACK_READY` (inferencer up + bridge connected) or reports an error.
+#[tauri::command]
+fn start_motion_playback(
+    app: tauri::AppHandle,
+    state: tauri::State<PlaybackState>,
+    id: String,
+    motion_path: String,
+    robot_ip: String,
+    loop_motion: bool,
+) -> Result<(), String> {
+    kill_playback(&state, &id);
+    let (python, script, bundle) = resolve_playback(&app)?;
+
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script)
+        .arg("--motion")
+        .arg(&motion_path)
+        .arg("--robot_ip")
+        .arg(&robot_ip)
+        .arg("--bundle")
+        .arg(&bundle)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    if loop_motion {
+        cmd.arg("--loop");
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start playback backend ('{python}'): {e}"))?;
+    let stdout = child.stdout.take().ok_or("no stdout from playback backend")?;
+    let stdin = child.stdin.take().ok_or("no stdin for playback backend")?;
+
+    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    let app_ev = app.clone();
+    let id_ev = id.clone();
+    std::thread::spawn(move || {
+        let mut sent = false;
+        for line in BufReader::new(stdout).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if !sent {
+                if line.starts_with("PLAYBACK_READY") {
+                    let _ = tx.send(Ok(()));
+                    sent = true;
+                } else if let Some(rest) = line.strip_prefix("ERROR ") {
+                    let _ = tx.send(Err(rest.trim().to_string()));
+                    sent = true;
+                }
+            }
+            // Forward every line to the UI so the popup can show live streaming
+            // status, frame cursor, loop/speed, ramp events and errors.
+            let (kind, data) = match line.split_once(' ') {
+                Some((k, r)) => (k.to_string(), r.to_string()),
+                None => (line, String::new()),
+            };
+            let _ = app_ev.emit(
+                "playback-event",
+                PlaybackEvent { id: id_ev.clone(), kind, data },
+            );
+        }
+        if !sent {
+            let _ = tx.send(Err("playback backend exited before it was ready".into()));
+        }
+        let _ = app_ev.emit(
+            "playback-event",
+            PlaybackEvent { id: id_ev.clone(), kind: "EXIT".into(), data: String::new() },
+        );
+    });
+
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(())) => {
+            state.0.lock().unwrap().insert(id, PlaybackProc { child, stdin });
+            Ok(())
+        }
+        Ok(Err(e)) => {
+            let _ = child.kill();
+            Err(e)
+        }
+        Err(_) => {
+            let _ = child.kill();
+            Err("timed out starting motion playback".into())
+        }
+    }
+}
+
+/// Send a control line to a robot's playback (start/play/pause/reset/stop/loop/speed).
+#[tauri::command]
+fn control_motion_playback(
+    state: tauri::State<PlaybackState>,
+    id: String,
+    command: String,
+) -> Result<(), String> {
+    let mut guard = state.0.lock().map_err(|_| "playback state poisoned")?;
+    let proc = guard.get_mut(&id).ok_or("no running playback for that robot")?;
+    writeln!(proc.stdin, "{command}").map_err(|e| e.to_string())?;
+    proc.stdin.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_motion_playback(state: tauri::State<PlaybackState>, id: String) -> Result<(), String> {
+    kill_playback(&state, &id);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -366,13 +544,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .manage(PreviewState::default())
+        .manage(PlaybackState::default())
         .invoke_handler(tauri::generate_handler![
             start_motion_preview,
             stop_motion_preview,
             control_motion_preview,
             run_onboard,
             save_library_file,
-            delete_library_file
+            delete_library_file,
+            start_motion_playback,
+            control_motion_playback,
+            stop_motion_playback
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

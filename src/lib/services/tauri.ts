@@ -6,6 +6,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { fetch as tauriFetch } from "@tauri-apps/plugin-http";
 
@@ -122,6 +123,26 @@ export async function hostWifiPsk(ssid: string): Promise<string> {
   return (d.psk as string) ?? "";
 }
 
+/** Start the on-robot dds_bridge_nx.py (on-demand, before motion playback).
+ *  Returns the laptop IP the bridge was told to stream lowstate to. */
+export async function robotBridgeStart(
+  host: string,
+  user: string,
+  sshPassword: string,
+): Promise<{ ok: boolean; pcIp: string }> {
+  const d = await runOnboard("bridge-start", { host, user, sshPassword });
+  return { ok: d.ok === true, pcIp: (d.pc_ip as string) ?? "" };
+}
+
+/** Stop the on-robot dds_bridge_nx.py after playback (best-effort). */
+export async function robotBridgeStop(
+  host: string,
+  user: string,
+  sshPassword: string,
+): Promise<void> {
+  await runOnboard("bridge-stop", { host, user, sshPassword });
+}
+
 /** Deploy the telemetry agent to the robot + register it as a systemd service. */
 export async function robotProvisionAgent(
   host: string,
@@ -195,4 +216,44 @@ export function stopMotionPreview(): Promise<void> {
 /** Send a control line ("pause" | "resume") to the running preview backend. */
 export function controlMotionPreview(command: "pause" | "resume"): Promise<void> {
   return invoke("control_motion_preview", { command });
+}
+
+// ---- on-robot motion playback (per-robot) --------------------------------
+
+/** Spawn motion playback for a robot; resolves once the backend is ready (or throws). */
+export function startMotionPlayback(
+  id: string,
+  motionPath: string,
+  robotIp: string,
+  loop = false,
+): Promise<void> {
+  return invoke("start_motion_playback", { id, motionPath, robotIp, loopMotion: loop });
+}
+
+/** Drive a robot's playback: start | play | pause | reset | stop | "loop on" | "speed 1.5". */
+export function controlMotionPlayback(id: string, command: string): Promise<void> {
+  return invoke("control_motion_playback", { id, command });
+}
+
+/** Stop a robot's playback (returns it to FSM 801). */
+export function stopMotionPlayback(id: string): Promise<void> {
+  return invoke("stop_motion_playback", { id });
+}
+
+/** One line of live status from a robot's playback backend. */
+export interface PlaybackEvent {
+  id: string;
+  /** STATUS | EVENT | ERROR | PLAYBACK_READY | EXIT */
+  kind: string;
+  /** remainder of the line; STATUS carries a JSON blob */
+  data: string;
+}
+
+/** Subscribe to live playback events from all robots. Returns an unlisten fn
+ *  (a no-op in the browser, where there is no backend). */
+export async function onPlaybackEvent(
+  cb: (e: PlaybackEvent) => void,
+): Promise<() => void> {
+  if (!isTauri()) return () => {};
+  return listen<PlaybackEvent>("playback-event", (ev) => cb(ev.payload));
 }

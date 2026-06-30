@@ -22,6 +22,20 @@
   let playSelected = $state<string[]>([]);
   let session = $derived(library.playSession);
 
+  function phaseLabel(phase?: string): string {
+    switch (phase) {
+      case "starting": return "Starting stream…";
+      case "connecting": return "Connecting to robot…";
+      case "ramping": return "Ramping into frame 0…";
+      case "holding": return "Holding at frame 0";
+      case "playing": return "Streaming";
+      case "ended": return "Reached end";
+      case "error": return "Failed";
+      case "stopped": return "Stopped";
+      default: return "Starting…";
+    }
+  }
+
   onMount(() => library.load());
 
   function openPlay(motion: ImportedMotion) {
@@ -325,10 +339,36 @@
       </div>
 
       <footer class="s-controls">
-        <span class="s-status mono">
-          {session.robotIds.length} robot{session.robotIds.length > 1 ? "s" : ""} · {session.paused ? "paused" : "playing"}
-        </span>
+        <div class="s-streams">
+          {#each session.robotIds as id (id)}
+            {@const st = session.status[id]}
+            <div class="s-stream">
+              <span class="s-rname">{robot.robots.find((r) => r.id === id)?.name ?? id}</span>
+              <span class="s-phase {st?.phase ?? 'starting'}">{phaseLabel(st?.phase)}</span>
+              {#if st && st.frames > 0}
+                <span class="s-frame mono">{st.frame} / {st.frames}</span>
+                <span class="s-bar">
+                  <span
+                    class="s-bar-fill"
+                    style="width:{Math.min(100, (st.frame / st.frames) * 100)}%"
+                  ></span>
+                </span>
+                {#if st.speed !== 1}<span class="s-spd mono">{st.speed}×</span>{/if}
+              {:else if st?.message}
+                <span class="s-msg" title={st.message}>{st.message}</span>
+              {/if}
+            </div>
+          {/each}
+        </div>
         <div class="s-actions">
+          <Button
+            variant={session.loop ? "primary" : "ghost"}
+            size="sm"
+            icon="refresh"
+            onclick={() => library.toggleLoop()}
+          >
+            Loop {session.loop ? "on" : "off"}
+          </Button>
           <Button
             variant={session.paused ? "primary" : "secondary"}
             size="sm"
@@ -459,7 +499,18 @@
   .s-x { display: grid; place-items: center; width: 30px; height: 30px; flex: none; border: 1px solid var(--border-strong); border-radius: var(--r-sm); background: var(--bg-elev-2); color: var(--text-secondary); transition: all var(--transition); }
   .s-x:hover { color: var(--red-bright); border-color: var(--red); background: var(--red-tint); }
   .s-body { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 14px; }
-  .s-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--border-soft); }
-  .s-status { font-size: 12px; color: var(--text-muted); }
-  .s-actions { display: flex; gap: 8px; }
+  .s-controls { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 12px 16px; border-top: 1px solid var(--border-soft); flex-wrap: wrap; }
+  .s-streams { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 1; }
+  .s-stream { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .s-rname { font-weight: 650; font-size: 12px; color: var(--text-primary); white-space: nowrap; }
+  .s-phase { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; padding: 2px 8px; border-radius: var(--r-pill); color: var(--text-muted); background: var(--bg-elev-2); border: 1px solid var(--border-soft); white-space: nowrap; }
+  .s-phase.playing { color: var(--green); background: var(--green-tint); border-color: color-mix(in srgb, var(--green) 40%, transparent); }
+  .s-phase.ramping, .s-phase.connecting, .s-phase.starting { color: var(--gold); background: color-mix(in srgb, var(--gold) 12%, transparent); border-color: color-mix(in srgb, var(--gold) 40%, transparent); }
+  .s-phase.error { color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); border-color: color-mix(in srgb, var(--red) 40%, transparent); }
+  .s-frame { font-size: 11px; color: var(--text-secondary); white-space: nowrap; }
+  .s-bar { flex: 1; min-width: 60px; max-width: 220px; height: 4px; background: var(--bg-elev-2); border-radius: var(--r-pill); overflow: hidden; }
+  .s-bar-fill { display: block; height: 100%; background: var(--gold); transition: width 0.1s linear; }
+  .s-spd { font-size: 11px; color: var(--text-muted); }
+  .s-msg { font-size: 11px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .s-actions { display: flex; gap: 8px; flex-shrink: 0; }
 </style>

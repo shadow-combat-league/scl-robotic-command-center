@@ -22,6 +22,8 @@ import {
   controlMotionPreview,
   saveLibraryFile,
   deleteLibraryFile,
+  onPlaybackEvent,
+  type PlaybackEvent,
 } from "./tauri";
 
 export interface ImportedMotion {
@@ -50,6 +52,26 @@ export type PreviewState = "idle" | "loading" | "ready" | "error";
 export type PreviewKind = "motion" | "policy";
 
 /** A live "play motion on robots" session (popup with the Meshcat view + controls). */
+export type PlaybackPhase =
+  | "starting"
+  | "connecting"
+  | "ramping"
+  | "holding"
+  | "playing"
+  | "ended"
+  | "error"
+  | "stopped";
+
+/** Live playback status for one robot, driven by the backend's STATUS/EVENT lines. */
+export interface PlaybackStatus {
+  phase: PlaybackPhase;
+  frame: number; // 1-based current frame
+  frames: number; // total frames (0 until known)
+  loop: boolean;
+  speed: number;
+  message: string;
+}
+
 export interface PlaySession {
   id: string;
   motionId: string;
@@ -58,6 +80,9 @@ export interface PlaySession {
   state: PreviewState;
   url: string;
   paused: boolean;
+  loop: boolean;
+  /** keyed by robot id */
+  status: Record<string, PlaybackStatus>;
 }
 
 const LAFAN_FPS = 30;
@@ -107,6 +132,7 @@ class Library {
 
   // live "play on robots" session
   playSession = $state<PlaySession | null>(null);
+  #unlistenPlayback: (() => void) | null = null;
 
   #loaded = false;
 
@@ -332,8 +358,18 @@ class Library {
   // ---------------- live playback session ----------------
   /** Trigger on-robot playback and open the live Meshcat popup. */
   async startPlaySession(motion: ImportedMotion, robotIds: string[]): Promise<void> {
-    robot.playMotionOn(robotIds, motion.name);
     const id = `play-${Date.now().toString(36)}`;
+    const status: Record<string, PlaybackStatus> = {};
+    for (const rid of robotIds) {
+      status[rid] = {
+        phase: isTauri() ? "starting" : "holding",
+        frame: 0,
+        frames: motion.frames || 0,
+        loop: false,
+        speed: 1,
+        message: isTauri() ? "starting stream…" : "preview only (desktop app streams to the robot)",
+      };
+    }
     this.playSession = {
       id,
       motionId: motion.id,
@@ -342,7 +378,16 @@ class Library {
       state: "loading",
       url: "",
       paused: true, // armed — starts paused; the popup's Play button resumes it
+      loop: false,
+      status,
     };
+
+    // Subscribe to live backend status BEFORE streaming starts so we catch the
+    // ramp / frame-cursor / bridge events.
+    this.#unlistenPlayback?.();
+    this.#unlistenPlayback = await onPlaybackEvent((e) => this.#onPlaybackEvent(e));
+
+    // Bring up the Meshcat visual (always — it's the on-screen preview).
     const targetType =
       robot.robots.find((r) => r.id === robotIds[0])?.type ?? this.previewRobot;
     let url = MESHCAT_URL;
@@ -357,17 +402,71 @@ class Library {
       await wait(1200);
     }
     if (this.playSession?.id !== id) return; // stopped or superseded
-    if (ok) {
-      this.playSession.url = url;
-      this.playSession.state = "ready";
-    } else {
-      this.playSession.state = "error";
+    this.playSession.url = url;
+    this.playSession.state = ok ? "ready" : "error";
+
+    // Kick off the real on-robot streaming; seed per-robot status on failure
+    // (success is then driven by the live STATUS/EVENT stream).
+    const res = await robot.playMotionOn(robotIds, motion.name, motion.path);
+    if (this.playSession?.id !== id) return;
+    for (const rid of robotIds) {
+      const r = res[rid];
+      const st = this.playSession.status[rid];
+      if (st && r && !r.ok) {
+        st.phase = "error";
+        st.message = r.error ?? "failed to start";
+      }
+    }
+  }
+
+  /** Fold one backend status line into the session's per-robot status. */
+  #onPlaybackEvent(e: PlaybackEvent): void {
+    const s = this.playSession;
+    const st = s?.status[e.id];
+    if (!s || !st) return;
+    if (e.kind === "STATUS") {
+      try {
+        const j = JSON.parse(e.data) as {
+          frame: number;
+          frames: number;
+          loop: boolean;
+          speed: number;
+          playing: boolean;
+          ramping: boolean;
+        };
+        st.frame = j.frame ?? st.frame;
+        st.frames = j.frames ?? st.frames;
+        st.loop = !!j.loop;
+        st.speed = j.speed ?? st.speed;
+        st.phase = j.ramping
+          ? "ramping"
+          : j.playing
+            ? "playing"
+            : st.frame >= st.frames && st.frames > 0
+              ? "ended"
+              : "holding";
+      } catch {
+        /* ignore malformed status */
+      }
+    } else if (e.kind === "EVENT") {
+      st.message = e.data;
+      if (e.data.includes("lowstate") || e.data.includes("bridge connected")) st.phase = "connecting";
+      else if (e.data.includes("ramping into frame 0")) st.phase = "ramping";
+      else if (e.data.includes("holding frame 0")) st.phase = "holding";
+      else if (e.data.includes("reached end")) st.phase = "ended";
+    } else if (e.kind === "ERROR") {
+      st.phase = "error";
+      st.message = e.data;
+    } else if (e.kind === "EXIT") {
+      if (st.phase !== "error" && st.phase !== "ended") st.phase = "stopped";
     }
   }
 
   stopPlaySession(): void {
     const s = this.playSession;
     if (!s) return;
+    this.#unlistenPlayback?.();
+    this.#unlistenPlayback = null;
     this.playSession = null;
     robot.stopMotionOn(s.robotIds, s.motionName);
     if (isTauri()) stopMotionPreview().catch(() => {});
@@ -375,10 +474,21 @@ class Library {
 
   togglePauseSession(): void {
     if (!this.playSession) return;
-    this.playSession.paused = !this.playSession.paused;
+    const paused = !this.playSession.paused;
+    this.playSession.paused = paused;
     if (isTauri()) {
-      controlMotionPreview(this.playSession.paused ? "pause" : "resume").catch(() => {});
+      controlMotionPreview(paused ? "pause" : "resume").catch(() => {});
     }
+    // Pause/resume the actual on-robot playback too (not just the viewer).
+    robot.setMotionPaused(this.playSession.robotIds, paused);
+  }
+
+  /** Toggle looping for the active session (robot playback + remembered state). */
+  toggleLoop(): void {
+    if (!this.playSession) return;
+    const loop = !this.playSession.loop;
+    this.playSession.loop = loop;
+    robot.setMotionLoop(this.playSession.robotIds, loop);
   }
 
   async removeMotion(id: string): Promise<void> {

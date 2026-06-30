@@ -279,9 +279,12 @@ class LocoController:
         "stand": [("fsm", 4)],  # Locked Standing (StandUp) — no named python wrapper
         "lockstand": [("fsm", 4)],
         "ready": [("fsm", 4)],
-        # Enter main operation control, then static balance so the robot stands
-        # still until commanded — no continuous step-in-place gait.
-        "run": [("call", "Start"), ("call", "SetBalanceMode", 0)],
+        # Locomotion / walking-stand FSM. This robot runs a custom WBC FSM scheme
+        # (same ids bvh_teleop.py uses: 801 = locomotion/walking stand on 'w',
+        # 504 = teleop tracking on 'f'). 801 is the operating stand the robot must
+        # be in *before* motion playback switches it to 504 — so "Run" must put it
+        # there, exactly like bvh_teleop.py, rather than the canonical balance mode.
+        "run": [("fsm", 801)],
         "zero": [("call", "ZeroTorque")],
     }
 

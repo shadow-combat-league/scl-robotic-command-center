@@ -323,6 +323,15 @@ def cmd_provision(a):
         unit = SYSTEMD_UNIT.format(python=python, port=port)
         with sftp.file("/tmp/scl-robot-agent.service", "w") as f:
             f.write(unit)
+
+        # Stage the on-robot motion-playback bridge for a sudo-install below.
+        # Write to /tmp (always world-writable) — a direct SFTP put into
+        # ~/dds_bridge fails with EACCES when the dir or existing file is
+        # root-owned, which it usually is.
+        bridge_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dds_bridge_nx.py")
+        have_bridge = os.path.exists(bridge_src)
+        if have_bridge:
+            sftp.put(bridge_src, "/tmp/scl-dds-bridge.py")
         sftp.close()
 
         # Tear down any previous install first, so re-onboarding never inherits a
@@ -355,6 +364,23 @@ def cmd_provision(a):
                 err(f"provision step failed ({cmd.split('install')[0].strip() or cmd[:40]}): "
                     f"{e.strip() or 'rc=' + str(rc)}")
 
+        # Install the motion-playback bridge into the SSH user's ~/dds_bridge.
+        # Best-effort: playback needs it, but the telemetry agent doesn't, so a
+        # failure here must NOT fail provisioning. sudo-install handles a dir or
+        # file that's root-owned; -D creates ~/dds_bridge if missing; 644 keeps
+        # it readable to the user that runs it at play time.
+        bridge_deployed = False
+        if have_bridge:
+            _, home, _ = _run(cli, "echo -n $HOME", timeout=10)
+            home = home.strip() or f"/home/{a.user}"
+            rc_b, _, _ = _run(
+                cli,
+                "sudo -S -p '' install -D -m644 /tmp/scl-dds-bridge.py "
+                f"{home}/dds_bridge/dds_bridge_nx.py",
+                sudo_pw=pw, timeout=20,
+            )
+            bridge_deployed = rc_b == 0
+
         # Give it a moment, then confirm it's up and answering HTTP.
         time.sleep(2)
         rc, active, _ = _run(cli, "sudo -S -p '' systemctl is-active scl-robot-agent",
@@ -371,7 +397,147 @@ def cmd_provision(a):
         rc, hbody, _ = _run(cli, health, timeout=15)
         if '"ok"' not in hbody:
             err(f"agent did not answer on port {port} (is it free?). Got: {hbody.strip()[:200]}")
-        out({"ok": True, "port": port, "python": python, "ddsAvailable": dds})
+        out({"ok": True, "port": port, "python": python, "ddsAvailable": dds,
+             "bridgeDeployed": bridge_deployed})
+    finally:
+        cli.close()
+
+
+def cmd_bridge_start(a):
+    """Start dds_bridge_nx.py on the robot's NX on demand (for motion playback).
+    Computes this computer's IP toward the robot for the bridge's --pc_ip, then
+    launches it detached so it survives the SSH session."""
+    pw = os.environ.get("SCL_SSH_PASSWORD", "")
+    pc_ip = ""
+    try:
+        sk = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sk.connect((a.host, 9501))  # no packet sent; just selects the route's local IP
+        pc_ip = sk.getsockname()[0]
+        sk.close()
+    except Exception:
+        pass
+    if not pc_ip:
+        err("could not determine this computer's IP toward the robot")
+    try:
+        cli = _connect(a.host, a.user, pw)
+    except Exception as e:
+        err(f"SSH failed: {e}")
+    try:
+        # Launch through a LOGIN + INTERACTIVE shell (bash -lic) so the user's
+        # environment is loaded — conda activation, LD_LIBRARY_PATH, and the
+        # CycloneDDS config that `ChannelFactoryInitialize` needs. A bare
+        # non-interactive exec misses all of that and CycloneDDS dies with
+        # "create domain error". Default to the shell's own `python` (what works
+        # when run by hand); `exec` so pgrep/pkill see the python directly.
+        # Resolve the NX→MCU ethernet interface. Its name varies by hardware
+        # (eth0, enP8p1s0, …) but is always an ethernet device (e*); Wi-Fi is
+        # wl*. Prefer the e* iface on the Unitree internal net (192.168.123.x),
+        # else the first UP e* with an IPv4.
+        iface = a.iface
+        if iface == "auto":
+            _, det, _ = _run(
+                cli,
+                # 1) e* iface on the Unitree internal net, else 2) first UP e*
+                # with an IPv4, else 3) first e* that is simply UP (no IPv4 yet).
+                "i=$(ip -o -4 addr show 2>/dev/null | "
+                "awk '$2 ~ /^e/ && $4 ~ /^192[.]168[.]123[.]/ {print $2; exit}'); "
+                "[ -z \"$i\" ] && i=$(ip -o -4 addr show up 2>/dev/null | "
+                "awk '$2 ~ /^e/ {print $2; exit}'); "
+                "[ -z \"$i\" ] && i=$(ip -br link 2>/dev/null | "
+                "awk '$1 ~ /^e/ && $2 == \"UP\" {print $1; exit}'); "
+                "echo \"$i\"",
+                timeout=10,
+            )
+            iface = det.strip() or "eth0"
+
+        # CYCLONEDDS_HOME (their from-source build): explicit arg > auto-detected
+        # install > ~/cyclonedds/install. It isn't in a non-interactively-sourced
+        # rc, so set it explicitly at launch.
+        cdds_home = a.cyclonedds_home
+        if not cdds_home:
+            _, found, _ = _run(
+                cli,
+                'for d in "$HOME/cyclonedds/install" "$HOME/cyclonedds_ws/install" '
+                '/opt/cyclonedds/install /usr/local; do '
+                '[ -e "$d/lib/libddsc.so" ] && { echo "$d"; break; }; done',
+                timeout=10,
+            )
+            cdds_home = found.strip()
+        if not cdds_home:
+            _, home, _ = _run(cli, "echo -n $HOME", timeout=10)
+            cdds_home = f"{(home.strip() or '/home/' + a.user)}/cyclonedds/install"
+
+        # CycloneDDS writes its trace to /tmp/cdds.LOG. An earlier (mistaken) root
+        # launch left that file root-owned, and /tmp is sticky — so the user's
+        # bridge can neither overwrite nor delete it ("cannot open for writing").
+        # Clear it (sudo, due to the sticky bit) so a fresh, user-owned one is made.
+        _run(cli, "sudo -S -p '' rm -rf /tmp/cdds.LOG 2>/dev/null || true",
+             sudo_pw=pw, timeout=10)
+
+        # Run the bridge AS THE SSH USER (the way it's run by hand) via a login +
+        # interactive shell so conda/env load; set CYCLONEDDS_HOME + the resolved
+        # interface explicitly. `exec` so pgrep/pkill see the python directly.
+        pyexe = a.bridge_python or "python"
+        # PYTHONUNBUFFERED + `-u`: the bridge writes to a file (not a TTY) so its
+        # stdout is block-buffered — without this its "[bridge] …" / "lowstate ->
+        # PC" lines never reach the log in time and the readiness check times out
+        # even when streaming is fine.
+        inner = (
+            f"export PYTHONUNBUFFERED=1; export CYCLONEDDS_HOME={cdds_home}; "
+            f"export LD_LIBRARY_PATH={cdds_home}/lib:${{LD_LIBRARY_PATH:-}}; "
+            f"cd {a.bridge_dir} && exec {pyexe} -u dds_bridge_nx.py "
+            f"--pc_ip {pc_ip} --iface {iface} --eef {a.eef}"
+        )
+        launch = (
+            f"setsid nohup bash -lic '{inner}' "
+            f"</dev/null >/tmp/scl-bridge.log 2>&1 & echo LAUNCHED"
+        )
+        _run(cli, launch, timeout=25)
+        # Wait until the bridge is actually FORWARDING lowstate to this PC. It
+        # inits LocoClient/AudioClient (each up to ~10s) BEFORE subscribing to
+        # rt/lowstate, and only logs "lowstate -> PC" once data flows — that is
+        # the true readiness signal (a live process alone isn't enough, which is
+        # why motion_play's 5s lowstate wait was timing out).
+        deadline = time.time() + 35.0
+        log = ""
+        flowing = False
+        while time.time() < deadline:
+            time.sleep(1.0)
+            _, ps, _ = _run(cli, "pgrep -f '[d]ds_bridge_nx.py' || true", timeout=10)
+            _, log, _ = _run(cli, "tail -n 30 /tmp/scl-bridge.log 2>/dev/null || true", timeout=10)
+            if not ps.strip():
+                _, ifaces, _ = _run(cli, "ip -br addr 2>/dev/null || ip addr", timeout=10)
+                err(f"bridge crashed on startup. tried --iface={iface}, "
+                    f"CYCLONEDDS_HOME={cdds_home}.\n"
+                    f"interfaces on robot:\n{ifaces.strip()[-600:]}\n"
+                    f"bridge log:\n{log.strip()[-500:] or '(empty)'}")
+            if "lowstate -> PC" in log:
+                flowing = True
+                break
+        if not flowing:
+            _, ifaces, _ = _run(cli, "ip -br addr 2>/dev/null || ip addr", timeout=10)
+            err("bridge started but no lowstate is reaching this PC within 35s — "
+                f"check the robot is powered/active and --iface ({iface}) is the "
+                "NX→MCU interface (pick one from the list below).\n"
+                f"interfaces on robot:\n{ifaces.strip()[-500:]}\n"
+                f"bridge log:\n{log.strip()[-500:] or '(empty)'}")
+        out({"ok": True, "pc_ip": pc_ip, "iface": iface, "log": log.strip()[-300:]})
+    finally:
+        cli.close()
+
+
+def cmd_bridge_stop(a):
+    """Stop the on-robot dds_bridge after playback (best-effort)."""
+    pw = os.environ.get("SCL_SSH_PASSWORD", "")
+    try:
+        cli = _connect(a.host, a.user, pw)
+    except Exception as e:
+        err(f"SSH failed: {e}")
+    try:
+        # The bridge now runs as root, so stopping it needs sudo.
+        _run(cli, "sudo -S -p '' pkill -f '[d]ds_bridge_nx.py' 2>/dev/null || true",
+             sudo_pw=pw, timeout=10)
+        out({"ok": True})
     finally:
         cli.close()
 
@@ -390,6 +556,15 @@ def main():
     prov.add_argument("--host", default="")
     prov.add_argument("--user", default="")
     prov.add_argument("--agent-port", type=int, default=8472)
+    for name in ("bridge-start", "bridge-stop"):
+        bp = sub.add_parser(name)
+        bp.add_argument("--host", default="")
+        bp.add_argument("--user", default="")
+        bp.add_argument("--iface", default="auto")
+        bp.add_argument("--eef", default="inspire")
+        bp.add_argument("--bridge-dir", dest="bridge_dir", default="~/dds_bridge")
+        bp.add_argument("--bridge-python", dest="bridge_python", default="")
+        bp.add_argument("--cyclonedds-home", dest="cyclonedds_home", default="")
     a = p.parse_args()
     handlers = {
         "reachable": cmd_reachable,
@@ -399,6 +574,8 @@ def main():
         "host-ssid": cmd_host_ssid,
         "host-psk": cmd_host_psk,
         "provision": cmd_provision,
+        "bridge-start": cmd_bridge_start,
+        "bridge-stop": cmd_bridge_stop,
     }
     try:
         handlers[a.action](a)
