@@ -337,6 +337,18 @@ class RobotService {
       const r = this.robots.find((x) => x.id === id);
       const name = r?.name ?? "robot";
       if (isTauri()) {
+        // Graceful stop: tell playback to stop streaming and switch the robot
+        // back to FSM 801 FIRST, then wait for the on-robot SetFsmId(801) to
+        // COMPLETE (the bridge's loco call blocks up to ~3s) before tearing
+        // anything down. Killing motion_play / the bridge mid-switch leaves the
+        // robot half-transitioned out of teleop (504), and in that state the
+        // agent's mode controls (Damp/Sit/Stand/Run) are all rejected.
+        try {
+          await controlMotionPlayback(id, "stop");
+          await new Promise((res) => setTimeout(res, 3500));
+        } catch {
+          /* best-effort */
+        }
         try {
           await stopMotionPlayback(id);
           if (r) await robotBridgeStop(r.ip, r.sshUser, r.sshPassword ?? "");
