@@ -257,3 +257,80 @@ export async function onPlaybackEvent(
   if (!isTauri()) return () => {};
   return listen<PlaybackEvent>("playback-event", (ev) => cb(ev.payload));
 }
+
+// ---- teleop headset discovery (XRoboToolkit) -----------------------------
+//
+// PROTOCOL CONTRACT (the headset, running XRoboToolkit, must implement this):
+//   Discovery:  GET  http://<headset-ip>:<PORT>/xrobo/info
+//               -> { "service":"xrobotoolkit", "id":"<stable-unique>",
+//                    "name":"<display>", "model":"<headset model>",
+//                    "battery":<0-100|null>, "status":"idle|paired|streaming",
+//                    "pcIp":"<currently paired pc ip, or empty>" }
+//   Pairing:    POST http://<headset-ip>:<PORT>/xrobo/pair
+//               body { "pcIp":"<this computer's ip>" }  -> 200 { "ok": true }
+//               (the headset stores pcIp and auto-connects for teleop)
+// The computer finds headsets by probing /xrobo/info across the Wi-Fi /24.
+
+/** Shape returned by a headset's /xrobo/info endpoint. */
+export interface HeadsetInfo {
+  service?: string;
+  id: string;
+  name?: string;
+  model?: string;
+  battery?: number | null;
+  status?: string;
+  pcIp?: string;
+}
+
+/** This computer's IPv4 on the active network (for the scan base + pairing). */
+export function localIpv4(): Promise<string> {
+  if (!isTauri()) return Promise.resolve("");
+  return invoke<string>("local_ipv4");
+}
+
+/**
+ * Probe one address for an XRoboToolkit headset. Resolves to its info, or null
+ * if nothing answers / it isn't a headset (kept fast — this runs ~254×/scan).
+ */
+export async function headsetInfo(
+  ip: string,
+  port: number,
+  timeoutMs = 500,
+): Promise<HeadsetInfo | null> {
+  if (!isTauri()) return null;
+  try {
+    const res = await tauriFetch(`http://${ip}:${port}/xrobo/info`, {
+      method: "GET",
+      connectTimeout: timeoutMs,
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as HeadsetInfo;
+    if (j && (j.service === "xrobotoolkit" || j.id)) return { ...j, id: j.id ?? ip };
+    return null;
+  } catch {
+    return null; // closed port / timeout / non-JSON — not a headset
+  }
+}
+
+/** Hand a headset this computer's IP so it auto-connects for teleop. */
+export async function pairHeadset(ip: string, port: number, pcIp: string): Promise<void> {
+  if (!isTauri()) return;
+  const res = await tauriFetch(`http://${ip}:${port}/xrobo/pair`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pcIp }),
+    connectTimeout: 3000,
+    signal: AbortSignal.timeout(4000),
+  });
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = (await res.json()) as { error?: string };
+      if (j.error) msg = j.error;
+    } catch {
+      /* non-JSON */
+    }
+    throw new Error(msg);
+  }
+}

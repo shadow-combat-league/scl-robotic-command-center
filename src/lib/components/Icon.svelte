@@ -17,6 +17,8 @@
     plus: '<path d="M12 5v14M5 12h14"/>',
     chevronRight: '<path d="m9 6 6 6-6 6"/>',
     signal: '<path d="M4 18v-3M9 18v-7M14 18V8M19 18V5"/>',
+    headset:
+      '<path d="M4 8h16a2 2 0 0 1 2 2v3a3 3 0 0 1-3 3h-3.2a2 2 0 0 1-1.7-1l-.9-1.4a1.5 1.5 0 0 0-2.6 0L9.9 15a2 2 0 0 1-1.7 1H5a3 3 0 0 1-3-3v-3a2 2 0 0 1 2-2z"/><path d="M7 8V6.5A1.5 1.5 0 0 1 8.5 5h7A1.5 1.5 0 0 1 17 6.5V8"/>',
     deploy: '<path d="M12 15V3"/><path d="m7 8 5-5 5 5"/><path d="M5 21h14"/>',
     play: '<path d="M7 4v16l13-8z"/>',
     user: '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/>',

@@ -6,6 +6,7 @@
     { href: "/", label: "Home", icon: "home" },
     { href: "/robot", label: "Robot", icon: "robot" },
     { href: "/teleoperate", label: "Teleop", icon: "cube" },
+    { href: "/headsets", label: "Headsets", icon: "headset" },
     { href: "/motions", label: "Motions", icon: "motion" },
     { href: "/settings", label: "Settings", icon: "settings" },
   ];

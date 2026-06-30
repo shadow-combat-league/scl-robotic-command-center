@@ -537,6 +537,23 @@ fn stop_motion_playback(state: tauri::State<PlaybackState>, id: String) -> Resul
     Ok(())
 }
 
+/// This computer's IPv4 on the active (Wi-Fi) network — the source address the
+/// OS would use to reach the LAN. No packet is sent (UDP connect just selects
+/// the route's local address). Used to derive the /24 to scan for headsets and
+/// to hand the headset our IP when pairing.
+#[tauri::command]
+fn local_ipv4() -> String {
+    use std::net::UdpSocket;
+    UdpSocket::bind("0.0.0.0:0")
+        .ok()
+        .and_then(|s| {
+            s.connect("8.8.8.8:80").ok()?;
+            s.local_addr().ok()
+        })
+        .map(|a| a.ip().to_string())
+        .unwrap_or_default()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -554,7 +571,8 @@ pub fn run() {
             delete_library_file,
             start_motion_playback,
             control_motion_playback,
-            stop_motion_playback
+            stop_motion_playback,
+            local_ipv4
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
