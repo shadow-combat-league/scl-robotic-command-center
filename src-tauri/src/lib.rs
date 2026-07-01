@@ -222,6 +222,7 @@ fn start_motion_preview(
     motion_path: String,
     robot: String,
     start_paused: bool,
+    loop_preview: bool,
 ) -> Result<String, String> {
     kill_existing(&state);
 
@@ -234,10 +235,13 @@ fn start_motion_preview(
         .arg(&motion_path)
         .arg("--robot")
         .arg(robot_key)
-        .arg("--loop")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
+    // Looping is toggleable live over stdin; --loop only sets the INITIAL state.
+    if loop_preview {
+        cmd.arg("--loop");
+    }
     if start_paused {
         cmd.arg("--start-paused");
     }
@@ -249,6 +253,26 @@ fn start_motion_preview(
         .spawn()
         .map_err(|e| format!("could not start preview backend ('{}'): {e}", paths.python))?;
     let stdout = child.stdout.take().ok_or("no stdout from preview backend")?;
+
+    // Collect the backend's stderr so a real failure (missing dep, bad path, a
+    // python traceback) surfaces in the UI instead of a generic timeout. Still
+    // echo each line so it also shows in the `tauri dev` terminal.
+    let errbuf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let errbuf = errbuf.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                eprintln!("[meshcat-preview] {line}");
+                if let Ok(mut b) = errbuf.lock() {
+                    b.push(line);
+                }
+            }
+        });
+    }
 
     // Read stdout on a thread: report the first MESHCAT_URL line, then keep
     // draining so the child never blocks on a full pipe.
@@ -275,15 +299,27 @@ fn start_motion_preview(
 
     *state.0.lock().unwrap() = Some(child);
 
+    // Last few stderr lines, to append to any error message.
+    let tail = || -> String {
+        errbuf
+            .lock()
+            .ok()
+            .map(|b| b[b.len().saturating_sub(4)..].join(" | "))
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_default()
+    };
     match rx.recv_timeout(Duration::from_secs(45)) {
         Ok(Ok(url)) => Ok(url),
         Ok(Err(e)) => {
             kill_existing(&state);
-            Err(e)
+            let t = tail();
+            Err(if t.is_empty() { e } else { format!("{e} — {t}") })
         }
         Err(_) => {
             kill_existing(&state);
-            Err("timed out starting the preview viewer".into())
+            let t = tail();
+            let base = "timed out starting the preview viewer";
+            Err(if t.is_empty() { base.into() } else { format!("{base} — {t}") })
         }
     }
 }
@@ -558,17 +594,42 @@ fn local_ipv4() -> String {
 #[derive(Default)]
 struct TeleopState(Mutex<HashMap<String, Child>>);
 
-/// (python, wbc_dir) for the teleop pipeline. Invokes the EXISTING heavy WBC env
-/// (pinocchio/GMR/xrobotoolkit_sdk/inference) rather than bundling it. Override
-/// with SCL_TELEOP_PYTHON / SCL_TELEOP_DIR.
-fn resolve_teleop() -> Result<(String, String), String> {
+/// (python, wbc_dir, pythonpath) for the teleop pipeline. Prefers the bundled,
+/// self-contained env (conda-packed wbc_pico + the WBC project under
+/// resources/teleop, built by tools/teleop/build_teleop_env.sh) so no machine
+/// setup is needed — the three editable deps are added via PYTHONPATH. Falls
+/// back to a wbc_pico env on the machine for dev (override via SCL_TELEOP_*).
+fn resolve_teleop(app: &tauri::AppHandle) -> Result<(String, String, String), String> {
+    let mut bases: Vec<String> = vec![format!("{DEV_RES}/teleop")];
+    if let Ok(p) = app.path().resolve("resources/teleop", BaseDirectory::Resource) {
+        bases.push(p2s(p));
+    }
+    for base in bases {
+        let py = format!("{base}/env/bin/python");
+        let wbc = format!("{base}/wbc");
+        if std::path::Path::new(&py).exists()
+            && std::path::Path::new(&wbc)
+                .join("whole_body_teleop_record_2.py")
+                .exists()
+        {
+            let pp = format!(
+                "{wbc}/third_party/GMR:{wbc}/third_party/unitree_sdk2_python:\
+                 {wbc}/eef/inspire/inspire_hand_ws/inspire_hand_sdk"
+            );
+            return Ok((py, wbc, pp));
+        }
+    }
+    // Dev fallback: a wbc_pico env + WBC project on the machine. Its own editable
+    // installs resolve the deps, so no PYTHONPATH is needed.
     let home = std::env::var("HOME").unwrap_or_default();
     let dir = std::env::var("SCL_TELEOP_DIR")
         .unwrap_or_else(|_| format!("{home}/SCL/WBC_Pico_Record"));
     let py = std::env::var("SCL_TELEOP_PYTHON")
         .unwrap_or_else(|_| format!("{home}/miniconda3/envs/wbc_pico/bin/python"));
     if !std::path::Path::new(&py).exists() {
-        return Err(format!("teleop python not found: {py} (set SCL_TELEOP_PYTHON)"));
+        return Err(format!(
+            "teleop env not bundled and no python at {py} — run tools/teleop/build_teleop_env.sh (or set SCL_TELEOP_PYTHON)"
+        ));
     }
     if !std::path::Path::new(&dir)
         .join("whole_body_teleop_record_2.py")
@@ -578,7 +639,7 @@ fn resolve_teleop() -> Result<(String, String), String> {
             "whole_body_teleop_record_2.py not found in {dir} (set SCL_TELEOP_DIR)"
         ));
     }
-    Ok((py, dir))
+    Ok((py, dir, String::new()))
 }
 
 fn kill_teleop(state: &TeleopState, id: &str) {
@@ -629,6 +690,7 @@ fn spawn_teleop_reader<R: std::io::Read + Send + 'static>(stream: R, tx: mpsc::S
 /// Returns the Meshcat web URL the script actually bound to.
 #[tauri::command]
 fn start_teleop(
+    app: tauri::AppHandle,
     state: tauri::State<TeleopState>,
     id: String,
     robot_ip: String,
@@ -649,9 +711,9 @@ fn start_teleop(
             .status();
         std::thread::sleep(Duration::from_millis(400));
     }
-    let (py, dir) = resolve_teleop()?;
-    let mut child = Command::new(&py)
-        .arg("whole_body_teleop_record_2.py")
+    let (py, dir, pythonpath) = resolve_teleop(&app)?;
+    let mut cmd = Command::new(&py);
+    cmd.arg("whole_body_teleop_record_2.py")
         .arg("--eef")
         .arg(&eef)
         .arg("--robot_ip")
@@ -659,7 +721,12 @@ fn start_teleop(
         .current_dir(&dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Bundled env: make the three source-only editable deps importable.
+    if !pythonpath.is_empty() {
+        cmd.env("PYTHONPATH", &pythonpath);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("could not start teleop ('{py}'): {e}"))?;
 

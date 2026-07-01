@@ -130,6 +130,12 @@ class RobotService {
   postureOf(id: string): string {
     return this.postures[id] ?? "idle";
   }
+  /** True when the robot is in Running Mode (FSM 801) — the required starting
+   *  point for teleop and motion playback. Both ramp out of the operating stand,
+   *  so starting from any other mode makes the robot drop or jump. */
+  isInRunningMode(id: string): boolean {
+    return this.postureOf(id) === "run";
+  }
   commandStateOf(id: string) {
     return this.cmdState[id];
   }
@@ -309,6 +315,12 @@ class RobotService {
         results[id] = { ok: false, error: "robot offline" };
         continue;
       }
+      // Safety gate: playback ramps out of the operating stand, so the robot
+      // must already be in Running Mode (the UI blocks this too).
+      if (!this.isInRunningMode(id)) {
+        results[id] = { ok: false, error: "robot must be in Running Mode" };
+        continue;
+      }
       if (isTauri() && motionPath) {
         this.cmdState[id] = { action: "play motion", phase: "sending", msg: motionName };
         try {
@@ -427,6 +439,11 @@ class RobotService {
     if (s === "running" || s === "starting") return;
     const r = this.robots.find((x) => x.id === id);
     const name = r?.name ?? "robot";
+    // Safety gate: teleop must begin from Running Mode (the UI blocks this too).
+    if (!this.isInRunningMode(id)) {
+      this.#log("error", `${name}: switch to Running Mode before teleoperation`);
+      return;
+    }
     this.teleop[id] = "starting";
     this.#log("info", `${name}: launching teleoperation…`);
     if (isTauri() && r) {

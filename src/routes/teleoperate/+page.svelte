@@ -6,6 +6,7 @@
   import Spinner from "$lib/components/Spinner.svelte";
   import StatusPill from "$lib/components/StatusPill.svelte";
   import StreamView from "$lib/components/StreamView.svelte";
+  import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
   import { robot } from "$lib/services/robot.svelte";
   import type { RobotProfile } from "$lib/services/types";
 
@@ -46,6 +47,34 @@
     if (st === "error") return "red";
     return "muted";
   }
+
+  // Teleop must start from Running Mode. If not, gate the start behind a dialog
+  // that offers to switch the affected robot(s) into Running Mode first.
+  let gateIds = $state<string[] | null>(null);
+  let gateNames = $derived(
+    (gateIds ?? []).map((id) => robot.robots.find((r) => r.id === id)?.name ?? "robot"),
+  );
+  function requestTeleop(id: string) {
+    if (!robot.isInRunningMode(id)) {
+      gateIds = [id];
+      return;
+    }
+    robot.startTeleop(id);
+  }
+  function requestTeleopAll() {
+    const notReady = robot.robots
+      .filter((r) => robot.teleopStateOf(r.id) === "stopped" && !robot.isInRunningMode(r.id))
+      .map((r) => r.id);
+    if (notReady.length) {
+      gateIds = notReady;
+      return;
+    }
+    robot.startTeleopAll();
+  }
+  function switchToRunning() {
+    for (const id of gateIds ?? []) robot.setPosture(id, "run");
+    gateIds = null;
+  }
 </script>
 
 <svelte:window onfullscreenchange={onFsChange} />
@@ -79,13 +108,13 @@
         <div class="tstate idle">
           <Icon name="alert" size={22} />
           <p>Teleoperation failed to start.</p>
-          <Button variant="primary" size="sm" icon="play" onclick={() => robot.startTeleop(r.id)}>Retry</Button>
+          <Button variant="primary" size="sm" icon="play" onclick={() => requestTeleop(r.id)}>Retry</Button>
         </div>
       {:else}
         <div class="tstate idle">
           <span class="cube"><Icon name="cube" size={28} /></span>
           <p>Teleoperation is not running. Start the script to view <strong>{r.name}</strong>'s live 3D state.</p>
-          <Button variant="primary" size="sm" icon="play" onclick={() => robot.startTeleop(r.id)}>Start Teleoperation</Button>
+          <Button variant="primary" size="sm" icon="play" onclick={() => requestTeleop(r.id)}>Start Teleoperation</Button>
         </div>
       {/if}
     </div>
@@ -131,7 +160,7 @@
         <Button variant="ghost" size="sm" icon="maximize" onclick={enterFullscreen}>Fullscreen</Button>
       {/if}
       {#if robot.anyTeleopStartable}
-        <Button variant="secondary" size="sm" icon="play" onclick={() => robot.startTeleopAll()}>Start All</Button>
+        <Button variant="secondary" size="sm" icon="play" onclick={() => requestTeleopAll()}>Start All</Button>
       {/if}
       {#if robot.anyTeleopActive}
         <Button variant="ghost" size="sm" icon="power" onclick={() => robot.stopTeleopAll()}>Stop All</Button>
@@ -161,6 +190,18 @@
       {/each}
     </div>
   {/if}
+{/if}
+
+{#if gateIds}
+  <ConfirmDialog
+    title="Switch to Running Mode?"
+    message={`Teleoperation must start from Running Mode. Switch ${
+      gateNames.length === 1 ? gateNames[0] : `${gateNames.length} robots`
+    } to Running Mode now, then press Start once the robot is standing.`}
+    confirmLabel="Switch to Running Mode"
+    onConfirm={switchToRunning}
+    onClose={() => (gateIds = null)}
+  />
 {/if}
 
 <style>

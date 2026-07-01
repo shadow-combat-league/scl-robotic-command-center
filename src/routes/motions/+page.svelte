@@ -7,6 +7,7 @@
   import Spinner from "$lib/components/Spinner.svelte";
   import StatusPill from "$lib/components/StatusPill.svelte";
   import StreamView from "$lib/components/StreamView.svelte";
+  import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
   import { library, type ImportedMotion } from "$lib/services/motions.svelte";
   import { robot } from "$lib/services/robot.svelte";
   import { ROBOT_TYPES } from "$lib/services/robotTypes";
@@ -47,11 +48,26 @@
       ? playSelected.filter((x) => x !== id)
       : [...playSelected, id];
   }
+  // Motion playback must start from Running Mode (the on-robot player ramps out
+  // of the operating stand). Gate on it, offering to switch the selected robots.
+  let gateIds = $state<string[] | null>(null);
+  let gateNames = $derived(
+    (gateIds ?? []).map((id) => robot.robots.find((r) => r.id === id)?.name ?? "robot"),
+  );
   function confirmPlay() {
     if (!playFor || playSelected.length === 0) return;
+    const notReady = playSelected.filter((id) => !robot.isInRunningMode(id));
+    if (notReady.length) {
+      gateIds = notReady; // keep the picker open so they can retry after switching
+      return;
+    }
     library.startPlaySession(playFor, playSelected);
     playFor = null;
     playSelected = [];
+  }
+  function switchToRunning() {
+    for (const id of gateIds ?? []) robot.setPosture(id, "run");
+    gateIds = null;
   }
 
   // In the desktop app: native dialog → absolute path → auto-spawned Meshcat
@@ -325,7 +341,10 @@
         {#if session.state === "loading"}
           <div class="loading-pane fill"><Spinner size={22} /> Starting playback…</div>
         {:else if session.state === "error"}
-          <div class="loading-pane fill err"><Icon name="alert" size={20} /> Couldn't start playback.</div>
+          <div class="loading-pane fill err">
+            <Icon name="alert" size={20} />
+            <span>Couldn't start the Meshcat preview.{session.error ? ` ${session.error}` : ""}</span>
+          </div>
         {:else}
           <StreamView
             fill
@@ -406,6 +425,18 @@
       </div>
     </div>
   </div>
+{/if}
+
+{#if gateIds}
+  <ConfirmDialog
+    title="Switch to Running Mode?"
+    message={`Motion playback must start from Running Mode. Switch ${
+      gateNames.length === 1 ? gateNames[0] : `${gateNames.length} robots`
+    } to Running Mode now, then press Play once the robot is standing.`}
+    confirmLabel="Switch to Running Mode"
+    onConfirm={switchToRunning}
+    onClose={() => (gateIds = null)}
+  />
 {/if}
 
 <style>

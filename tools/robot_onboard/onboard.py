@@ -18,6 +18,7 @@ sudo is fed the SSH password via `sudo -S` (works whether or not sudo needs it).
 import argparse
 import json
 import os
+import posixpath
 import re
 import socket
 import sys
@@ -266,7 +267,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={python} /opt/scl/robot_agent.py --port {port}
+{env}ExecStart={python} /opt/scl/robot_agent.py --port {port}
 Restart=always
 RestartSec=3
 
@@ -281,9 +282,14 @@ _PY_GLOBS = (
 )
 
 
-def _pick_python(cli):
+def _pick_python(cli, cdds_home=""):
     """Choose a python interpreter on the robot, preferring one that can import
-    unitree_sdk2py (→ live DDS telemetry). Returns (abs_path, dds_available)."""
+    unitree_sdk2py (→ live DDS telemetry). Returns (abs_path, dds_available).
+
+    The import probe runs with the SAME CycloneDDS env the agent will run with
+    (CYCLONEDDS_HOME / LD_LIBRARY_PATH). unitree_sdk2py loads libddsc.so at import
+    time, so a from-source CycloneDDS is invisible without it — probing bare would
+    wrongly report no SDK and leave the agent without the env it needs."""
     cands = []
     _, sys_py, _ = _run(cli, "command -v python3")
     sys_py = sys_py.strip().splitlines()[0] if sys_py.strip() else ""
@@ -294,11 +300,36 @@ def _pick_python(cli):
         p = line.strip()
         if p and p not in cands:
             cands.append(p)
+    env = ""
+    if cdds_home:
+        env = f"CYCLONEDDS_HOME={cdds_home} LD_LIBRARY_PATH={cdds_home}/lib "
     for py in cands:
-        rc, _, _ = _run(cli, f'{py} -c "import unitree_sdk2py" 2>/dev/null', timeout=20)
+        rc, _, _ = _run(cli, f'{env}{py} -c "import unitree_sdk2py" 2>/dev/null', timeout=20)
         if rc == 0:
             return py, True
     return (cands[0] if cands else "/usr/bin/python3"), False
+
+
+def _detect_cyclonedds_home(cli, explicit=""):
+    """Locate the robot's CycloneDDS install (usually a from-source build) so its
+    libddsc.so can be put on LD_LIBRARY_PATH — without it unitree_sdk2py's
+    ChannelFactory can't create a domain ('create domain error', surfaced to the
+    UI as 'channel factory init error'). Explicit path wins; else probe the usual
+    locations; else fall back to the conventional ~/cyclonedds/install."""
+    if explicit:
+        return explicit
+    _, found, _ = _run(
+        cli,
+        'for d in "$HOME/cyclonedds/install" "$HOME/cyclonedds_ws/install" '
+        '/opt/cyclonedds/install /usr/local; do '
+        '[ -e "$d/lib/libddsc.so" ] && { echo "$d"; break; }; done',
+        timeout=10,
+    )
+    cdds_home = found.strip()
+    if not cdds_home:
+        _, home, _ = _run(cli, "echo -n $HOME", timeout=10)
+        cdds_home = f"{home.strip() or '/root'}/cyclonedds/install"
+    return cdds_home
 
 
 def cmd_provision(a):
@@ -319,8 +350,24 @@ def cmd_provision(a):
         sftp = cli.open_sftp()
         with sftp.file("/tmp/scl-robot-agent.py", "w") as f:
             f.write(agent_src)
-        python, dds = _pick_python(cli)
-        unit = SYSTEMD_UNIT.format(python=python, port=port)
+        # Give the agent the SAME CycloneDDS environment the on-demand bridge
+        # sets up (see cmd_bridge_start). A bare systemd ExecStart has no login
+        # shell, so CYCLONEDDS_HOME / LD_LIBRARY_PATH are absent and the SDK's
+        # ChannelFactory can't create a domain → 'channel factory init error' on
+        # every mode command, and rt/lowstate never arrives (battery/temps blank).
+        cdds_home = _detect_cyclonedds_home(cli)
+        python, dds = _pick_python(cli, cdds_home)
+        env_lines = "Environment=PYTHONUNBUFFERED=1\n"
+        if dds and cdds_home:
+            # systemd runs the interpreter directly (no conda activation), so also
+            # put its env's own lib on LD_LIBRARY_PATH — activation-equivalent, so
+            # the cyclonedds C extension finds conda-provided libs (libstdc++, …).
+            py_lib = posixpath.dirname(posixpath.dirname(python)) + "/lib"
+            env_lines += (
+                f"Environment=CYCLONEDDS_HOME={cdds_home}\n"
+                f"Environment=LD_LIBRARY_PATH={cdds_home}/lib:{py_lib}\n"
+            )
+        unit = SYSTEMD_UNIT.format(python=python, port=port, env=env_lines)
         with sftp.file("/tmp/scl-robot-agent.service", "w") as f:
             f.write(unit)
 
@@ -452,20 +499,9 @@ def cmd_bridge_start(a):
 
         # CYCLONEDDS_HOME (their from-source build): explicit arg > auto-detected
         # install > ~/cyclonedds/install. It isn't in a non-interactively-sourced
-        # rc, so set it explicitly at launch.
-        cdds_home = a.cyclonedds_home
-        if not cdds_home:
-            _, found, _ = _run(
-                cli,
-                'for d in "$HOME/cyclonedds/install" "$HOME/cyclonedds_ws/install" '
-                '/opt/cyclonedds/install /usr/local; do '
-                '[ -e "$d/lib/libddsc.so" ] && { echo "$d"; break; }; done',
-                timeout=10,
-            )
-            cdds_home = found.strip()
-        if not cdds_home:
-            _, home, _ = _run(cli, "echo -n $HOME", timeout=10)
-            cdds_home = f"{(home.strip() or '/home/' + a.user)}/cyclonedds/install"
+        # rc, so set it explicitly at launch. Shared with the agent's systemd unit
+        # (cmd_provision) so both load the same DDS runtime.
+        cdds_home = _detect_cyclonedds_home(cli, a.cyclonedds_home)
 
         # CycloneDDS writes its trace to /tmp/cdds.LOG. An earlier (mistaken) root
         # launch left that file root-owned, and /tmp is sticky — so the user's

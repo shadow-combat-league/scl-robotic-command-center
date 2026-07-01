@@ -35,6 +35,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": ["resources/**/*"]
+    "resources": [
+      "resources/robot_agent/**/*",
+      "resources/robot_onboard/**/*",
+      "resources/meshcat_preview/**/*"
+    ]
   }
 }

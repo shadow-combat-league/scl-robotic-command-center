@@ -81,6 +81,8 @@ export interface PlaySession {
   url: string;
   paused: boolean;
   loop: boolean;
+  /** why the Meshcat viewer failed to start (shown in the popup when state==error) */
+  error?: string;
   /** keyed by robot id */
   status: Record<string, PlaybackStatus>;
 }
@@ -240,7 +242,8 @@ class Library {
     const motion = this.motions.find((m) => m.id === id);
     if (motion?.path && isTauri()) {
       try {
-        const url = await startMotionPreview(motion.path, this.previewRobot);
+        // Plain inspection preview (no loop toggle in its UI) — loop continuously.
+        const url = await startMotionPreview(motion.path, this.previewRobot, false, true);
         if (this.previewId !== id) return;
         this.previewUrl = url;
         this.previewState = "ready";
@@ -392,11 +395,16 @@ class Library {
       robot.robots.find((r) => r.id === robotIds[0])?.type ?? this.previewRobot;
     let url = MESHCAT_URL;
     let ok = true;
+    let previewErr = "";
     if (motion.path && isTauri()) {
       try {
-        url = await startMotionPreview(motion.path, targetType, true); // start paused
-      } catch {
+        // start paused + loop off — matches the session's initial state, so the
+        // viewer holds on the last frame at the end unless the operator enables loop.
+        url = await startMotionPreview(motion.path, targetType, true, this.playSession.loop);
+      } catch (e) {
         ok = false;
+        previewErr = e instanceof Error ? e.message : String(e);
+        console.error("[playback] Meshcat preview failed to start:", previewErr);
       }
     } else {
       await wait(1200);
@@ -404,6 +412,7 @@ class Library {
     if (this.playSession?.id !== id) return; // stopped or superseded
     this.playSession.url = url;
     this.playSession.state = ok ? "ready" : "error";
+    this.playSession.error = previewErr || undefined;
 
     // Kick off the real on-robot streaming; seed per-robot status on failure
     // (success is then driven by the live STATUS/EVENT stream).
@@ -483,12 +492,16 @@ class Library {
     robot.setMotionPaused(this.playSession.robotIds, paused);
   }
 
-  /** Toggle looping for the active session (robot playback + remembered state). */
+  /** Toggle looping for the active session — both the on-robot player AND the
+   *  Meshcat viewer, so the two stay in sync (the viewer used to loop forever). */
   toggleLoop(): void {
     if (!this.playSession) return;
     const loop = !this.playSession.loop;
     this.playSession.loop = loop;
     robot.setMotionLoop(this.playSession.robotIds, loop);
+    if (isTauri()) {
+      controlMotionPreview(loop ? "loop on" : "loop off").catch(() => {});
+    }
   }
 
   async removeMotion(id: string): Promise<void> {

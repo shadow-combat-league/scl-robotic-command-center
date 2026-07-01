@@ -205,16 +205,24 @@ export function startMotionPreview(
   motionPath: string,
   robot: string,
   startPaused = false,
+  loop = false,
 ): Promise<string> {
-  return invoke<string>("start_motion_preview", { motionPath, robot, startPaused });
+  return invoke<string>("start_motion_preview", {
+    motionPath,
+    robot,
+    startPaused,
+    loopPreview: loop,
+  });
 }
 
 export function stopMotionPreview(): Promise<void> {
   return invoke("stop_motion_preview");
 }
 
-/** Send a control line ("pause" | "resume") to the running preview backend. */
-export function controlMotionPreview(command: "pause" | "resume"): Promise<void> {
+/** Send a control line to the preview viewer: pause/resume or loop on/off. */
+export function controlMotionPreview(
+  command: "pause" | "resume" | "loop on" | "loop off",
+): Promise<void> {
   return invoke("control_motion_preview", { command });
 }
 

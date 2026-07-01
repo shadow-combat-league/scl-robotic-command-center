@@ -3,6 +3,7 @@
   import Button from "./Button.svelte";
   import StatusPill from "./StatusPill.svelte";
   import Spinner from "./Spinner.svelte";
+  import ConfirmDialog from "./ConfirmDialog.svelte";
   import { robot } from "$lib/services/robot.svelte";
   import { robotTypeSpec } from "$lib/services/robotTypes";
   import type { RobotProfile } from "$lib/services/types";
@@ -32,15 +33,31 @@
   let estopped = $derived(conn === "online" && tel.estop);
 
   // High-level modes commanded on the robot (maps to the agent's LocoClient actions).
-  const MODES: { key: string; label: string }[] = [
-    { key: "damp", label: "Damp" },
-    { key: "sit", label: "Sit" },
+  const MODES: { key: string; label: string; hint?: string }[] = [
+    { key: "damp", label: "Damp", hint: "Motors go limp — the robot drops immediately" },
+    { key: "squat", label: "Squat", hint: "Squat down (press again to stand back up)" },
     { key: "stand", label: "Locked Standing" },
     { key: "run", label: "Run" },
+    { key: "squat2stand", label: "Squat → Stand", hint: "Stand up from a squat" },
+    {
+      key: "lie2stand",
+      label: "Lie → Stand",
+      hint: "Get up from lying face-up — needs hard, flat, level ground",
+    },
   ];
   // Friendly label for a command key (the key is the agent's protocol token).
   function modeLabel(key: string): string {
     return MODES.find((m) => m.key === key)?.label ?? key;
+  }
+
+  // Damp makes the robot go limp and drop, so confirm before commanding it.
+  let confirmDamp = $state(false);
+  function onMode(key: string): void {
+    if (key === "damp") {
+      confirmDamp = true;
+      return;
+    }
+    robot.setPosture(profile.id, key);
   }
 
   function uptime(sec: number): string {
@@ -111,7 +128,8 @@
             class="ctl"
             class:active={posture === m.key}
             disabled={estopped || cmd?.phase === "sending"}
-            onclick={() => robot.setPosture(profile.id, m.key)}
+            title={m.hint}
+            onclick={() => onMode(m.key)}
           >{m.label}</button>
         {/each}
       </div>
@@ -154,6 +172,20 @@
     </footer>
   {/if}
 </article>
+
+{#if confirmDamp}
+  <ConfirmDialog
+    title="Switch to Damping?"
+    message="The robot will drop immediately after it turns into damping mode. Are you sure?"
+    confirmLabel="Damp"
+    danger
+    onConfirm={() => {
+      confirmDamp = false;
+      robot.setPosture(profile.id, "damp");
+    }}
+    onClose={() => (confirmDamp = false)}
+  />
+{/if}
 
 <style>
   .card {

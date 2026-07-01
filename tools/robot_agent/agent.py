@@ -275,7 +275,12 @@ class LocoController:
 
     ACTIONS = {
         "damp": [("call", "Damp")],
-        "sit": [("call", "Sit")],
+        # Squat. The canonical Sit (SetFsmId 3) makes this custom-WBC G1 fall, so
+        # this is a controlled squat via SetFsmId 706 — a toggle: from standing it
+        # squats down, from a squat it stands back up. NO damp first (damping just
+        # drops the robot). "sit" is kept as an alias of "squat".
+        "squat": [("call", "StandUp2Squat")],
+        "sit": [("call", "StandUp2Squat")],
         "stand": [("fsm", 4)],  # Locked Standing (StandUp) — no named python wrapper
         "lockstand": [("fsm", 4)],
         "ready": [("fsm", 4)],
@@ -286,6 +291,11 @@ class LocoController:
         # there, exactly like bvh_teleop.py, rather than the canonical balance mode.
         "run": [("fsm", 801)],
         "zero": [("call", "ZeroTorque")],
+        # Get-up / recovery — the direct stand-up transitions (SetFsmId 706 / 702),
+        # NO damp first (damping collapses the robot). Lie2StandUp requires the
+        # robot face-up on hard, flat, level ground.
+        "squat2stand": [("call", "Squat2StandUp")],
+        "lie2stand": [("call", "Lie2StandUp")],
     }
 
     def __init__(self, domain=0, iface=None):

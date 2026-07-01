@@ -193,6 +193,9 @@ def main() -> None:
     import threading
 
     paused = threading.Event()
+    loop_enabled = threading.Event()
+    if args.loop:
+        loop_enabled.set()
 
     def _stdin_control():
         try:
@@ -202,6 +205,10 @@ def main() -> None:
                     paused.set()
                 elif cmd == "resume":
                     paused.clear()
+                elif cmd in ("loop on", "loop"):
+                    loop_enabled.set()
+                elif cmd == "loop off":
+                    loop_enabled.clear()
                 elif cmd == "stop":
                     os._exit(0)
         except Exception:
@@ -221,10 +228,13 @@ def main() -> None:
 
     dt = 1.0 / args.fps
     i = 0
+    ended = False  # reached the end with looping off — hold on the final frame
     print(f"[meshcat-preview] playing {n} frames @ {args.fps}fps")
     while True:
-        if paused.is_set():
-            time.sleep(0.05)  # hold the current pose
+        # Hold the current pose while paused, or parked on the last frame after a
+        # non-looping run (mirrors the on-robot player, which also holds at end).
+        if paused.is_set() or ended:
+            time.sleep(0.05)
             continue
         qpos = get_qpos(i)
         data.qpos[: len(qpos)] = qpos
@@ -233,9 +243,11 @@ def main() -> None:
         time.sleep(dt)
         i += 1
         if i >= n:
-            if not args.loop:
-                break
-            i = 0
+            if loop_enabled.is_set():
+                i = 0
+            else:
+                i = n - 1  # park on the final frame instead of looping/exiting
+                ended = True
 
 
 if __name__ == "__main__":
