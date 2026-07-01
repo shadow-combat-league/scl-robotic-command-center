@@ -8,6 +8,7 @@
   import StreamView from "$lib/components/StreamView.svelte";
   import ConfirmDialog from "$lib/components/ConfirmDialog.svelte";
   import { robot } from "$lib/services/robot.svelte";
+  import { headsets, type Headset } from "$lib/services/headsets.svelte";
   import type { RobotProfile } from "$lib/services/types";
 
   const STATE = {
@@ -75,12 +76,28 @@
     for (const id of gateIds ?? []) robot.setPosture(id, "run");
     gateIds = null;
   }
+
+  // ---- per-robot headset assignment ----
+  // The headset appointed to this robot (paired to its service port), if any.
+  function assignedHeadset(robotId: string): Headset | undefined {
+    return headsets.headsets.find((h) => h.assignedRobotId === robotId);
+  }
+  // Online headsets free to assign here (unassigned, or already this robot's).
+  function availableHeadsets(robotId: string): Headset[] {
+    return headsets.headsets.filter(
+      (h) => h.online && (!h.assignedRobotId || h.assignedRobotId === robotId),
+    );
+  }
+  function assignHeadset(robotId: string, headsetId: string) {
+    if (headsetId) headsets.pairToRobot(headsetId, robotId);
+  }
 </script>
 
 <svelte:window onfullscreenchange={onFsChange} />
 
 {#snippet card(r: RobotProfile)}
   {@const st = robot.teleopStateOf(r.id)}
+  {@const ah = assignedHeadset(r.id)}
   <article class="tcard" class:running={st === "running"}>
     <header class="thead">
       <span class="tmark"><Icon name="robot" size={17} /></span>
@@ -89,9 +106,44 @@
         <span class="tmodel mono">{robot.modelName(r)}</span>
       </span>
       <StatusPill tone={STATE[st].tone} pulse={st === "running" || st === "starting"}>
-        {STATE[st].label}
+        {robot.teleopPausedOf(r.id) && st === "running" ? "Paused" : STATE[st].label}
       </StatusPill>
+      {#if st === "running"}
+        <Button
+          size="sm"
+          variant={robot.teleopPausedOf(r.id) ? "primary" : "ghost"}
+          icon={robot.teleopPausedOf(r.id) ? "play" : "pause"}
+          onclick={() => robot.setTeleopPaused(r.id, !robot.teleopPausedOf(r.id))}
+        >
+          {robot.teleopPausedOf(r.id) ? "Resume" : "Pause"}
+        </Button>
+      {/if}
     </header>
+
+    <div class="hs-row">
+      <span class="hs-label label">Headset</span>
+      {#if ah}
+        <span class="hs-on" title={`Paired to this PC :${robot.servicePortOf(r.id)}`}>
+          <Icon name="check" size={12} />
+          {ah.name}<span class="mono"> · :{robot.servicePortOf(r.id)}</span>
+        </span>
+        <button class="hs-btn" onclick={() => headsets.unpair(ah.id)}>Unassign</button>
+      {:else}
+        <select
+          class="hs-sel"
+          aria-label={`Assign a headset to ${r.name}`}
+          onchange={(e) => assignHeadset(r.id, e.currentTarget.value)}
+        >
+          <option value="">Assign a headset…</option>
+          {#each availableHeadsets(r.id) as h (h.id)}
+            <option value={h.id}>{h.name}{h.battery != null ? ` · ${h.battery}%` : ""}</option>
+          {/each}
+        </select>
+        <button class="hs-btn" onclick={() => headsets.discover()} disabled={headsets.scanning}>
+          {headsets.scanning ? "Scanning…" : "Scan"}
+        </button>
+      {/if}
+    </div>
 
     <div class="tbody">
       {#if st === "running"}
@@ -226,6 +278,27 @@
   .tid { display: flex; flex-direction: column; gap: 1px; margin-right: auto; min-width: 0; }
   .tname { font-weight: 650; font-size: 14px; }
   .tmodel { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); }
+
+  /* ---- headset assignment row ---- */
+  .hs-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+  .hs-label { color: var(--text-muted); flex: none; }
+  .hs-on {
+    display: inline-flex; align-items: center; gap: 6px; min-width: 0;
+    color: var(--green); font-size: 12.5px; font-weight: 600;
+  }
+  .hs-on .mono { color: var(--text-muted); font-weight: 400; }
+  .hs-sel {
+    flex: 1; min-width: 0; height: 30px; padding: 0 8px;
+    background: var(--bg-elev-2); color: var(--text-primary);
+    border: 1px solid var(--border-strong); border-radius: var(--r-md); font-size: 12.5px;
+  }
+  .hs-btn {
+    flex: none; height: 30px; padding: 0 11px; cursor: pointer;
+    background: var(--bg-elev-2); color: var(--text-secondary);
+    border: 1px solid var(--border-strong); border-radius: var(--r-md); font-size: 12px;
+  }
+  .hs-btn:hover:not(:disabled) { color: var(--text-primary); border-color: var(--gold); }
+  .hs-btn:disabled { opacity: 0.5; cursor: default; }
 
   .tbody { display: flex; flex-direction: column; flex: 1; min-height: 0; }
   .tstate {
