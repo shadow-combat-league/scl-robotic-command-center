@@ -25,6 +25,7 @@ import {
   robotBridgeStop,
   startTeleopScript,
   stopTeleopScript,
+  startXroboService,
 } from "./tauri";
 import type {
   ActivityEvent,
@@ -135,6 +136,22 @@ class RobotService {
    *  so starting from any other mode makes the robot drop or jump. */
   isInRunningMode(id: string): boolean {
     return this.postureOf(id) === "run";
+  }
+
+  // --- Per-robot XRoboToolkit service ports (one PC-Service instance per robot,
+  // all on this PC's single IP). A robot's stable slot = its index among all
+  // robots ordered by id; slot k → Pico control port 63901+k, gRPC 60061+k.
+  #serviceSlot(id: string): number {
+    const i = this.robots.map((r) => r.id).sort().indexOf(id);
+    return i < 0 ? 0 : i;
+  }
+  /** XRoboToolkit control port a Pico dials to reach THIS robot's instance (pcPort). */
+  servicePortOf(id: string): number {
+    return 63901 + this.#serviceSlot(id);
+  }
+  /** XRoboToolkit gRPC port this robot's teleop script connects to. */
+  grpcPortOf(id: string): number {
+    return 60061 + this.#serviceSlot(id);
   }
   commandStateOf(id: string) {
     return this.cmdState[id];
@@ -448,6 +465,9 @@ class RobotService {
     this.#log("info", `${name}: launching teleoperation…`);
     if (isTauri() && r) {
       try {
+        // Bring up THIS robot's XRoboToolkit service instance (its own ports on
+        // this PC's IP) so its paired headset connects to the right one.
+        await startXroboService(this.servicePortOf(id), this.grpcPortOf(id));
         await robotBridgeStart(r.ip, r.sshUser, r.sshPassword ?? "");
         // The script picks a free Meshcat port (7000/7001/7002/…); use the URL
         // it actually bound to rather than assuming a port.

@@ -262,6 +262,19 @@ export function stopTeleopScript(id: string): Promise<void> {
   return invoke("stop_teleop", { id });
 }
 
+/** Ensure this robot's XRoboToolkit PC-Service instance is running: `tcpPort`
+ *  = the Pico control port (a headset's pcPort), `grpcPort` = the teleop SDK. */
+export function startXroboService(tcpPort: number, grpcPort: number): Promise<void> {
+  if (!isTauri()) return Promise.resolve();
+  return invoke("start_xrobo_service", { tcpPort, grpcPort });
+}
+
+/** Stop the XRoboToolkit PC-Service instance on a control port. */
+export function stopXroboService(tcpPort: number): Promise<void> {
+  if (!isTauri()) return Promise.resolve();
+  return invoke("stop_xrobo_service", { tcpPort });
+}
+
 /** One line of live status from a robot's playback backend. */
 export interface PlaybackEvent {
   id: string;
@@ -302,6 +315,7 @@ export interface HeadsetInfo {
   battery?: number | null;
   status?: string;
   pcIp?: string;
+  pcPort?: number; // which robot's PC-Service instance this headset is paired to
 }
 
 /** This computer's IPv4 on the active network (for the scan base + pairing). */
@@ -335,13 +349,25 @@ export async function headsetInfo(
   }
 }
 
-/** Hand a headset this computer's IP so it auto-connects for teleop. */
-export async function pairHeadset(ip: string, port: number, pcIp: string): Promise<void> {
+/**
+ * Hand a headset this computer's IP + the PC-Service port to dial, so it
+ * auto-connects for teleop. `pcPort` appoints which robot (one service instance
+ * per robot, e.g. 63901, 63902, …); omit/0 → the Pico defaults to 63901.
+ * An empty `pcIp` unpairs.
+ */
+export async function pairHeadset(
+  ip: string,
+  port: number,
+  pcIp: string,
+  pcPort?: number,
+): Promise<void> {
   if (!isTauri()) return;
+  const body: { pcIp: string; pcPort?: number } = { pcIp };
+  if (pcPort && pcPort > 0) body.pcPort = pcPort;
   const res = await tauriFetch(`http://${ip}:${port}/xrobo/pair`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ pcIp }),
+    body: JSON.stringify(body),
     connectTimeout: 3000,
     signal: AbortSignal.timeout(4000),
   });

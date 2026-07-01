@@ -11,6 +11,7 @@
  * connects back automatically — no input needed on the headset side.
  */
 import { isTauri, localIpv4, headsetInfo, pairHeadset, type HeadsetInfo } from "./tauri";
+import { robot } from "./robot.svelte";
 
 export type HeadsetStatus =
   | "discovered" // seen on the network, not paired to this PC
@@ -29,6 +30,8 @@ export interface Headset {
   battery: number | null;
   status: HeadsetStatus;
   pairedPcIp: string;
+  pcPort?: number; // PC-Service port paired to (which robot's instance)
+  assignedRobotId?: string; // the robot this headset teleoperates
   online: boolean;
   lastSeen: number;
   error?: string;
@@ -139,6 +142,31 @@ class Headsets {
     }
   }
 
+  /**
+   * Appoint a headset to a specific robot: pair it with this PC's IP AND that
+   * robot's XRoboToolkit control port, so the Pico dials that robot's instance.
+   */
+  async pairToRobot(id: string, robotId: string): Promise<void> {
+    const h = this.headsets.find((x) => x.id === id);
+    if (!h) return;
+    const pcPort = robot.servicePortOf(robotId);
+    h.status = "pairing";
+    h.error = undefined;
+    try {
+      if (!this.pcIp) this.pcIp = await localIpv4();
+      if (isTauri()) await pairHeadset(h.ip, h.port, this.pcIp, pcPort);
+      else await wait(500);
+      h.status = "paired";
+      h.pairedPcIp = this.pcIp;
+      h.pcPort = pcPort;
+      h.assignedRobotId = robotId;
+      this.#persist();
+    } catch (e) {
+      h.status = "error";
+      h.error = e instanceof Error ? e.message : String(e);
+    }
+  }
+
   /** Tell the headset to stop connecting back to this PC. */
   async unpair(id: string): Promise<void> {
     const h = this.headsets.find((x) => x.id === id);
@@ -150,6 +178,8 @@ class Headsets {
     }
     h.status = h.online ? "discovered" : "offline";
     h.pairedPcIp = "";
+    h.pcPort = undefined;
+    h.assignedRobotId = undefined;
     this.#persist();
   }
 
@@ -174,6 +204,7 @@ class Headsets {
       existing.model = info.model ?? existing.model;
       existing.battery = info.battery ?? null;
       existing.pairedPcIp = pairedPcIp;
+      if (info.pcPort) existing.pcPort = info.pcPort;
       existing.online = true;
       existing.status = existing.status === "pairing" ? "pairing" : status;
       existing.lastSeen = Date.now();
@@ -223,6 +254,8 @@ class Headsets {
           model: s.model ?? "XR headset",
           battery: null,
           pairedPcIp: s.pairedPcIp ?? "",
+          pcPort: s.pcPort,
+          assignedRobotId: s.assignedRobotId,
           online: false,
           status: (s.pairedPcIp ? "paired" : "offline") as HeadsetStatus,
           lastSeen: 0,
@@ -241,6 +274,8 @@ class Headsets {
       ip: h.ip,
       port: h.port,
       pairedPcIp: h.pairedPcIp,
+      pcPort: h.pcPort,
+      assignedRobotId: h.assignedRobotId,
     }));
     localStorage.setItem(KEY, JSON.stringify(subset));
   }

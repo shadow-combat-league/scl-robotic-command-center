@@ -590,6 +590,113 @@ fn local_ipv4() -> String {
         .unwrap_or_default()
 }
 
+// ---- multi-robot XRoboToolkit PC-Service instances -------------------------
+// One RoboticsServiceProcess per robot, all on this PC's single IP, told apart
+// by port: TcpBindPort = the Pico control port (a headset's pcPort), listenPort
+// = the gRPC the teleop SDK dials. Runs the INSTALLED service (the .deb at
+// /opt/apps/roboticsservice, or SCL_XROBO_DIR) with NO rebuild: each instance
+// runs a copy of the binary from its own dir (so applicationDirPath → its own
+// setting.ini for TcpBindPort) with a private XDG_DATA_HOME (so the built-in
+// single-instance lockfile doesn't collide). Validated end-to-end in step (a).
+#[derive(Default)]
+struct XroboState(Mutex<HashMap<u16, Child>>);
+
+fn xrobo_install_dir() -> String {
+    std::env::var("SCL_XROBO_DIR").unwrap_or_else(|_| "/opt/apps/roboticsservice".to_string())
+}
+
+/// Ensure an XRoboToolkit PC-Service is up for a robot: `tcp_port` (Pico control)
+/// + `grpc_port` (teleop SDK). Idempotent — a no-op if that instance is alive.
+#[tauri::command]
+fn start_xrobo_service(
+    app: tauri::AppHandle,
+    state: tauri::State<XroboState>,
+    tcp_port: u16,
+    grpc_port: u16,
+) -> Result<(), String> {
+    {
+        let mut g = state.0.lock().map_err(|_| "xrobo state poisoned")?;
+        if let Some(child) = g.get_mut(&tcp_port) {
+            match child.try_wait() {
+                Ok(None) => return Ok(()), // still running
+                _ => {
+                    g.remove(&tcp_port);
+                } // died — fall through to relaunch
+            }
+        }
+    }
+
+    let src = xrobo_install_dir();
+    let bin = format!("{src}/RoboticsServiceProcess");
+    if !std::path::Path::new(&bin).exists() {
+        return Err(format!(
+            "XRoboToolkit service not installed at {src} (set SCL_XROBO_DIR)"
+        ));
+    }
+
+    // Per-instance dir: own binary copy + own setting.ini + own XDG_DATA_HOME.
+    let inst = app
+        .path()
+        .resolve(format!("xrobo/inst-{tcp_port}"), BaseDirectory::AppLocalData)
+        .map(p2s)
+        .unwrap_or_else(|_| format!("/tmp/scl-xrobo/inst-{tcp_port}"));
+    let xdg = format!("{inst}/xdg");
+    std::fs::create_dir_all(&xdg).map_err(|e| format!("mkdir {inst}: {e}"))?;
+    std::fs::copy(&bin, format!("{inst}/RoboticsServiceProcess"))
+        .map_err(|e| format!("copy service binary: {e}"))?;
+
+    // Build the instance setting.ini from the install's: insert listenPort under
+    // [Service] and append a [TCP] section (matches the validated step-(a) recipe).
+    let base_ini = std::fs::read_to_string(format!("{src}/setting.ini")).unwrap_or_default();
+    let bcast = 29888u32 + (tcp_port as u32).saturating_sub(63901); // distinct per instance
+    let mut ini = if base_ini.contains("[Service]") {
+        base_ini.replacen("[Service]", &format!("[Service]\nlistenPort={grpc_port}"), 1)
+    } else {
+        format!("{base_ini}\n[Service]\nlistenPort={grpc_port}\n")
+    };
+    ini.push_str(&format!(
+        "\n[TCP]\nTcpBindPort={tcp_port}\nBroadCastSendPort={bcast}\n"
+    ));
+    std::fs::write(format!("{inst}/setting.ini"), ini)
+        .map_err(|e| format!("write setting.ini: {e}"))?;
+
+    let ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    let mut cmd = Command::new(format!("{inst}/RoboticsServiceProcess"));
+    cmd.current_dir(&inst)
+        .env("XDG_DATA_HOME", &xdg)
+        .env("QT_QPA_PLATFORM", "offscreen")
+        .env("LD_LIBRARY_PATH", format!("{src}:{src}/lib:{src}/SDK/x64:{ld}"))
+        .env("QT_PLUGIN_PATH", format!("{src}/plugins/"))
+        .env("QT_QML_PATH", format!("{src}/qml/"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not launch XRoboToolkit service: {e}"))?;
+
+    // Catch an immediate exit (bad port, missing lib) instead of reporting success.
+    std::thread::sleep(Duration::from_millis(1500));
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(format!(
+            "XRoboToolkit service (port {tcp_port}) exited on startup ({status}) — check {inst}"
+        ));
+    }
+    state.0.lock().unwrap().insert(tcp_port, child);
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_xrobo_service(state: tauri::State<XroboState>, tcp_port: u16) -> Result<(), String> {
+    if let Ok(mut g) = state.0.lock() {
+        if let Some(mut child) = g.remove(&tcp_port) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    Ok(())
+}
+
 // ---- live teleoperation (whole_body_teleop_record_2.py, WBC env) ----------
 #[derive(Default)]
 struct TeleopState(Mutex<HashMap<String, Child>>);
@@ -775,6 +882,7 @@ pub fn run() {
         .manage(PreviewState::default())
         .manage(PlaybackState::default())
         .manage(TeleopState::default())
+        .manage(XroboState::default())
         .invoke_handler(tauri::generate_handler![
             start_motion_preview,
             stop_motion_preview,
@@ -786,6 +894,8 @@ pub fn run() {
             control_motion_playback,
             stop_motion_playback,
             local_ipv4,
+            start_xrobo_service,
+            stop_xrobo_service,
             start_teleop,
             stop_teleop
         ])
