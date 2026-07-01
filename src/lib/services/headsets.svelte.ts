@@ -171,6 +171,7 @@ class Headsets {
   async unpair(id: string): Promise<void> {
     const h = this.headsets.find((x) => x.id === id);
     if (!h) return;
+    const robotId = h.assignedRobotId; // the robot this headset was driving, if any
     try {
       if (isTauri()) await pairHeadset(h.ip, h.port, ""); // empty pcIp = disconnect
     } catch {
@@ -181,6 +182,9 @@ class Headsets {
     h.pcPort = undefined;
     h.assignedRobotId = undefined;
     this.#persist();
+    // Unassigning ends this robot's teleop → stop it, which returns the robot to
+    // Running mode (the teleop script's shutdown does SetFsmId(801)).
+    if (robotId) robot.stopTeleop(robotId).catch(() => {});
   }
 
   /** Drop a headset from the known list. */
