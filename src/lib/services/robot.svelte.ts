@@ -25,6 +25,7 @@ import {
   robotBridgeStop,
   startTeleopScript,
   stopTeleopScript,
+  controlTeleopScript,
   startXroboService,
 } from "./tauri";
 import type {
@@ -91,6 +92,7 @@ class RobotService {
   postures = $state<Record<string, string>>({});
   /** Teleoperation script state + the Meshcat viewer URL it publishes to. */
   teleop = $state<Record<string, TeleopState>>({});
+  teleopPaused = $state<Record<string, boolean>>({}); // desktop paused this robot's tracking
   meshcatUrls = $state<Record<string, string>>({});
   /** Result of the most recent mode command per robot (for inline UI feedback). */
   cmdState = $state<
@@ -152,6 +154,10 @@ class RobotService {
   /** XRoboToolkit gRPC port this robot's teleop script connects to. */
   grpcPortOf(id: string): number {
     return 60061 + this.#serviceSlot(id);
+  }
+  /** Stable 0-based slot — also the PC-side UDP port offset for teleop/bridge. */
+  serviceSlotOf(id: string): number {
+    return this.#serviceSlot(id);
   }
   commandStateOf(id: string) {
     return this.cmdState[id];
@@ -422,6 +428,27 @@ class RobotService {
   meshcatUrlOf(id: string): string {
     return this.meshcatUrls[id] ?? "";
   }
+  teleopPausedOf(id: string): boolean {
+    return this.teleopPaused[id] ?? false;
+  }
+  /** Desktop authority: pause (freeze the robot) or resume its live tracking
+   *  without tearing down the teleop pipeline. No-op unless teleop is running. */
+  async setTeleopPaused(id: string, paused: boolean): Promise<void> {
+    if (this.teleopStateOf(id) !== "running") return;
+    this.teleopPaused[id] = paused;
+    const name = this.robots.find((r) => r.id === id)?.name ?? "robot";
+    if (isTauri()) {
+      try {
+        await controlTeleopScript(id, paused ? "pause" : "resume");
+        this.#log("info", `${name}: teleop ${paused ? "paused" : "resumed"}`);
+      } catch (e) {
+        this.teleopPaused[id] = !paused; // revert optimistic flip
+        this.#log("error", `${name}: ${paused ? "pause" : "resume"} failed — ${e}`);
+      }
+    } else {
+      this.#log("info", `${name}: teleop ${paused ? "paused" : "resumed"} (simulated)`);
+    }
+  }
   isTeleoperating(id: string): boolean {
     return this.teleopStateOf(id) === "running";
   }
@@ -462,16 +489,20 @@ class RobotService {
       return;
     }
     this.teleop[id] = "starting";
+    this.teleopPaused[id] = false; // fresh teleop starts tracking (not paused)
     this.#log("info", `${name}: launching teleoperation…`);
     if (isTauri() && r) {
       try {
         // Bring up THIS robot's XRoboToolkit service instance (its own ports on
         // this PC's IP) so its paired headset connects to the right one.
+        const slot = this.serviceSlotOf(id);
         await startXroboService(this.servicePortOf(id), this.grpcPortOf(id));
-        await robotBridgeStart(r.ip, r.sshUser, r.sshPassword ?? "");
+        // Bridge streams lowstate to this PC on the robot's offset port (matches
+        // the teleop's bind offset below), so concurrent robots don't collide.
+        await robotBridgeStart(r.ip, r.sshUser, r.sshPassword ?? "", slot);
         // The script picks a free Meshcat port (7000/7001/7002/…); use the URL
         // it actually bound to rather than assuming a port.
-        const url = await startTeleopScript(id, r.ip, "inspire"); // eef default; per-robot config later
+        const url = await startTeleopScript(id, r.ip, "inspire", slot, this.grpcPortOf(id));
         this.meshcatUrls[id] = url;
         this.teleop[id] = "running";
         this.#log("success", `${name}: teleoperation running`);
@@ -494,6 +525,7 @@ class RobotService {
     const r = this.robots.find((x) => x.id === id);
     const name = r?.name ?? "robot";
     this.teleop[id] = "stopped";
+    this.teleopPaused[id] = false;
     delete this.meshcatUrls[id];
     if (isTauri() && r) {
       try {

@@ -128,6 +128,7 @@ fn run_onboard_blocking(
     ssh_password: &str,
     wifi_password: &str,
     agent_port: u16,
+    port_offset: u16,
 ) -> Result<String, String> {
     let (python, root) = python_env(app);
     // Resolve onboard.py by first-existing candidate — the bundled root may lag
@@ -169,6 +170,9 @@ fn run_onboard_blocking(
     }
     cmd.env("SCL_SSH_PASSWORD", ssh_password)
         .env("SCL_WIFI_PASSWORD", wifi_password)
+        // Per-robot PC-side UDP offset for bridge-start (the on-robot bridge sends
+        // lowstate to this PC's offset port, matching the teleop's bind offset).
+        .env("SCL_PORT_OFFSET", port_offset.to_string())
         .stdin(Stdio::null())
         .stderr(Stdio::piped());
     let output = cmd
@@ -203,11 +207,14 @@ async fn run_onboard(
     ssh_password: String,
     wifi_password: String,
     agent_port: Option<u16>,
+    port_offset: Option<u16>,
 ) -> Result<String, String> {
     let agent_port = agent_port.unwrap_or(8472);
+    let port_offset = port_offset.unwrap_or(0);
     tauri::async_runtime::spawn_blocking(move || {
         run_onboard_blocking(
             &app, &action, &host, &user, &ssid, &ssh_password, &wifi_password, agent_port,
+            port_offset,
         )
     })
     .await
@@ -802,31 +809,58 @@ fn start_teleop(
     id: String,
     robot_ip: String,
     eef: String,
+    port_offset: u16,
+    grpc_port: u16,
 ) -> Result<String, String> {
     kill_teleop(&state, &id);
-    // Sweep any ORPHAN teleop script still holding the fixed UDP ports (9501…)
-    // — e.g. left over from a `tauri dev` relaunch or crash, which the fresh
-    // process can't track — otherwise the new one fails to bind 9501. Run pkill
-    // directly (no shell) so it excludes its own PID; the new process below
-    // isn't spawned yet, so only orphans are killed. (One teleop at a time.)
+    // Sweep only an ORPHAN holding THIS robot's lowstate port (9501+offset) — e.g.
+    // left over from a `tauri dev` relaunch/crash. Targeted (not a global pkill)
+    // so concurrent teleops for OTHER robots are untouched.
     #[cfg(unix)]
     {
-        let _ = Command::new("pkill")
-            .arg("-9")
-            .arg("-f")
-            .arg("whole_body_teleop_record_2")
+        let lowstate_port = 9501u16 + port_offset;
+        let _ = Command::new("fuser")
+            .arg("-k")
+            .arg(format!("{lowstate_port}/udp"))
             .status();
         std::thread::sleep(Duration::from_millis(400));
     }
     let (py, dir, pythonpath) = resolve_teleop(&app)?;
+    let script = format!("{dir}/whole_body_teleop_record_2.py");
+    // Per-instance working dir so each teleop's PXREASetting.ini (its gRPC port,
+    // written by the script from SCL_GRPC_PORT) is isolated. The script also
+    // loads some assets by CWD-relative path (e.g. assets/g1/*.urdf), so mirror
+    // the WBC project into this cwd via symlinks — those paths resolve back to the
+    // real files, while PXREASetting.ini stays a real per-instance file here.
+    let cwd = app
+        .path()
+        .resolve(format!("teleop-cwd/{id}"), BaseDirectory::AppLocalData)
+        .map(p2s)
+        .unwrap_or_else(|_| format!("/tmp/scl-teleop-cwd/{id}"));
+    std::fs::create_dir_all(&cwd).map_err(|e| format!("mkdir teleop cwd: {e}"))?;
+    #[cfg(unix)]
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            if name == *"PXREASetting.ini" {
+                continue; // must be a real per-instance file, not a shared symlink
+            }
+            let link = std::path::Path::new(&cwd).join(&name);
+            if std::fs::symlink_metadata(&link).is_err() {
+                let _ = std::os::unix::fs::symlink(e.path(), &link);
+            }
+        }
+    }
     let mut cmd = Command::new(&py);
-    cmd.arg("whole_body_teleop_record_2.py")
+    cmd.arg(&script)
         .arg("--eef")
         .arg(&eef)
         .arg("--robot_ip")
         .arg(&robot_ip)
-        .current_dir(&dir)
-        .stdin(Stdio::null())
+        .current_dir(&cwd)
+        .env("SCL_PORT_OFFSET", port_offset.to_string())
+        .env("SCL_GRPC_PORT", grpc_port.to_string())
+        .stdin(Stdio::piped()) // kept open so the desktop can pause/resume/stop
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Bundled env: make the three source-only editable deps importable.
@@ -873,6 +907,25 @@ fn stop_teleop(state: tauri::State<TeleopState>, id: String) -> Result<(), Strin
     Ok(())
 }
 
+/// Live control of a running teleop over its stdin: "pause" / "resume" (freeze or
+/// resume the robot's motion tracking) or "stop". Lets the desktop operator take
+/// control instead of the Pico having sole authority once connected.
+#[tauri::command]
+fn control_teleop(
+    state: tauri::State<TeleopState>,
+    id: String,
+    command: String,
+) -> Result<(), String> {
+    let mut guard = state.0.lock().map_err(|_| "teleop state poisoned")?;
+    let child = guard
+        .get_mut(&id)
+        .ok_or("no running teleop for this robot")?;
+    let stdin = child.stdin.as_mut().ok_or("teleop stdin unavailable")?;
+    writeln!(stdin, "{command}").map_err(|e| e.to_string())?;
+    stdin.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -897,7 +950,8 @@ pub fn run() {
             start_xrobo_service,
             stop_xrobo_service,
             start_teleop,
-            stop_teleop
+            stop_teleop,
+            control_teleop
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

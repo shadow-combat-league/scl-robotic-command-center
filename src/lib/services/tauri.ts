@@ -57,6 +57,7 @@ interface OnboardArgs {
   sshPassword?: string;
   wifiPassword?: string;
   agentPort?: number;
+  portOffset?: number;
 }
 
 async function runOnboard(action: string, args: OnboardArgs): Promise<Record<string, unknown>> {
@@ -68,6 +69,7 @@ async function runOnboard(action: string, args: OnboardArgs): Promise<Record<str
     sshPassword: args.sshPassword ?? "",
     wifiPassword: args.wifiPassword ?? "",
     agentPort: args.agentPort,
+    portOffset: args.portOffset,
   });
   const data = JSON.parse(raw) as Record<string, unknown>;
   if (typeof data.error === "string") throw new Error(data.error);
@@ -129,8 +131,9 @@ export async function robotBridgeStart(
   host: string,
   user: string,
   sshPassword: string,
+  portOffset = 0,
 ): Promise<{ ok: boolean; pcIp: string }> {
-  const d = await runOnboard("bridge-start", { host, user, sshPassword });
+  const d = await runOnboard("bridge-start", { host, user, sshPassword, portOffset });
   return { ok: d.ok === true, pcIp: (d.pc_ip as string) ?? "" };
 }
 
@@ -253,13 +256,28 @@ export function stopMotionPlayback(id: string): Promise<void> {
 /** Start the live teleop pipeline for a robot — reads the paired headset via
  *  xrobotoolkit_sdk, retargets, and streams to the robot over the UDP bridge.
  *  Resolves to the Meshcat web URL the script actually bound to (dynamic port). */
-export function startTeleopScript(id: string, robotIp: string, eef: string): Promise<string> {
-  return invoke("start_teleop", { id, robotIp, eef });
+export function startTeleopScript(
+  id: string,
+  robotIp: string,
+  eef: string,
+  portOffset = 0,
+  grpcPort = 60061,
+): Promise<string> {
+  return invoke("start_teleop", { id, robotIp, eef, portOffset, grpcPort });
 }
 
 /** Stop a robot's teleop pipeline (SIGINT → the script returns it to FSM 801). */
 export function stopTeleopScript(id: string): Promise<void> {
   return invoke("stop_teleop", { id });
+}
+
+/** Live-control a running teleop over its stdin: pause/resume the robot's motion
+ *  tracking (freeze in place) or stop it — desktop authority over the Pico. */
+export function controlTeleopScript(
+  id: string,
+  command: "pause" | "resume" | "stop",
+): Promise<void> {
+  return invoke("control_teleop", { id, command });
 }
 
 /** Ensure this robot's XRoboToolkit PC-Service instance is running: `tcpPort`
