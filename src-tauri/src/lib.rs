@@ -633,6 +633,15 @@ fn start_xrobo_service(
         }
     }
 
+    // If a service already owns this control port (a default RoboticsServiceProcess
+    // on 63901, or an earlier launch), REUSE it — never launch a colliding
+    // duplicate. A duplicate can't bind the control port yet still opens a second
+    // gRPC listener, so the Pico and the teleop SDK end up on different instances
+    // ("Connecting" forever). One service per control port, period.
+    if std::net::TcpListener::bind(("0.0.0.0", tcp_port)).is_err() {
+        return Ok(());
+    }
+
     let src = xrobo_install_dir();
     let bin = format!("{src}/RoboticsServiceProcess");
     if !std::path::Path::new(&bin).exists() {
@@ -720,7 +729,9 @@ fn resolve_teleop(app: &tauri::AppHandle) -> Result<(String, String, String), St
     }
     for base in bases {
         let py = format!("{base}/env/bin/python");
-        let wbc = format!("{base}/wbc");
+        // Keep the project dir named WBC_Pico_Record — the teleop script derives
+        // asset paths as get_project_root()/WBC_Pico_Record/assets/….
+        let wbc = format!("{base}/WBC_Pico_Record");
         if std::path::Path::new(&py).exists()
             && std::path::Path::new(&wbc)
                 .join("whole_body_teleop_record_2.py")
@@ -818,10 +829,16 @@ fn start_teleop(
     // so concurrent teleops for OTHER robots are untouched.
     #[cfg(unix)]
     {
-        let lowstate_port = 9501u16 + port_offset;
+        // Free THIS robot's PC-side bind ports if an orphan teleop (e.g. from a
+        // dev relaunch/crash) still holds them: lowstate 9501+off AND hand 9505+off
+        // (both bound by the teleop). Targeted per-robot so other robots' teleops
+        // are untouched.
+        let ls = 9501u16 + port_offset;
+        let hs = 9505u16 + port_offset;
         let _ = Command::new("fuser")
             .arg("-k")
-            .arg(format!("{lowstate_port}/udp"))
+            .arg(format!("{ls}/udp"))
+            .arg(format!("{hs}/udp"))
             .status();
         std::thread::sleep(Duration::from_millis(400));
     }
@@ -846,7 +863,10 @@ fn start_teleop(
                 continue; // must be a real per-instance file, not a shared symlink
             }
             let link = std::path::Path::new(&cwd).join(&name);
-            if std::fs::symlink_metadata(&link).is_err() {
+            // Recreate when missing or dangling so a reused cwd self-heals (e.g.
+            // after the project dir was renamed, old symlinks would dangle).
+            if !link.exists() {
+                let _ = std::fs::remove_file(&link); // drop a stale/broken symlink
                 let _ = std::os::unix::fs::symlink(e.path(), &link);
             }
         }

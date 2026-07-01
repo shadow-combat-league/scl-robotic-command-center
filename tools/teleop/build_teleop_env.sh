@@ -3,7 +3,7 @@
 # Bundle the `wbc_pico` conda env + the WBC_Pico_Record project into the app so
 # live teleoperation needs NO machine setup. Produces:
 #   src-tauri/resources/teleop/env/   -- relocatable conda-packed wbc_pico env
-#   src-tauri/resources/teleop/wbc/   -- the WBC project (script + assets + deps)
+#   src-tauri/resources/teleop/WBC_Pico_Record/   -- the WBC project (script + assets + deps)
 #
 # The three editable deps (general_motion_retargeting, unitree_sdk2py,
 # inspire_sdkpy) can't be conda-packed (editable installs), but they're pure
@@ -48,20 +48,28 @@ rm -f "$PACK"
 # link ("resource path ... doesn't exist"). A broken link is unusable anyway.
 find "$DEST/env" -type l ! -exec test -e {} \; -delete 2>/dev/null || true
 
+# Force Meshcat's teleop 3D viewer onto ports >10K (default 7000/6000). Only the
+# module constant controls the web port (no CLI arg), and the viewer runs as a
+# fresh subprocess, so patch the packed module directly.
+for z in "$DEST"/env/lib/python*/site-packages/meshcat/servers/zmqserver.py; do
+  [ -f "$z" ] && sed -i \
+    's/^DEFAULT_FILESERVER_PORT = 7000/DEFAULT_FILESERVER_PORT = 10700/; s/^DEFAULT_ZMQ_PORT = 6000/DEFAULT_ZMQ_PORT = 10600/' "$z"
+done
+
 # 2) copy the WBC project (skip huge recording dirs + caches).
 echo "[teleop-bundle] copying WBC project…"
-rm -rf "$DEST/wbc"; mkdir -p "$DEST/wbc"
+rm -rf "$DEST/WBC_Pico_Record"; mkdir -p "$DEST/WBC_Pico_Record"
 rsync -a \
   --exclude 'instances/' --exclude 'data/' --exclude '.git/' \
   --exclude '__pycache__/' --exclude '*.pyc' \
   --exclude '/core' --exclude 'core.[0-9]*' \
-  "$WBC/" "$DEST/wbc/"
+  "$WBC/" "$DEST/WBC_Pico_Record/"
 
 # 3) sanity: the bundled python imports every teleop dep from the bundle.
-PP="$DEST/wbc/third_party/GMR:$DEST/wbc/third_party/unitree_sdk2_python:$DEST/wbc/eef/inspire/inspire_hand_ws/inspire_hand_sdk"
+PP="$DEST/WBC_Pico_Record/third_party/GMR:$DEST/WBC_Pico_Record/third_party/unitree_sdk2_python:$DEST/WBC_Pico_Record/eef/inspire/inspire_hand_ws/inspire_hand_sdk"
 echo "[teleop-bundle] verifying imports…"
-( cd "$DEST/wbc" && PYTHONPATH="$PP" "$DEST/env/bin/python" -c \
+( cd "$DEST/WBC_Pico_Record" && PYTHONPATH="$PP" "$DEST/env/bin/python" -c \
   "import pinocchio, onnxruntime, xrobotoolkit_sdk, general_motion_retargeting, unitree_sdk2py, meshcat; print('[teleop-bundle] imports OK')" )
 
 echo "[teleop-bundle] done."
-du -sh "$DEST/env" "$DEST/wbc" 2>/dev/null || true
+du -sh "$DEST/env" "$DEST/WBC_Pico_Record" 2>/dev/null || true
