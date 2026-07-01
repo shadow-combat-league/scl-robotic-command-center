@@ -514,12 +514,17 @@ def cmd_bridge_start(a):
         # interactive shell so conda/env load; set CYCLONEDDS_HOME + the resolved
         # interface explicitly. `exec` so pgrep/pkill see the python directly.
         pyexe = a.bridge_python or "python"
+        # Per-robot PC-side UDP offset (from the command center): the bridge sends
+        # lowstate/hand to pc_ip:(9501+off)/(9505+off) so multiple robots don't
+        # collide on this PC. Default 0 keeps the single-robot behavior.
+        port_offset = os.environ.get("SCL_PORT_OFFSET", "0")
         # PYTHONUNBUFFERED + `-u`: the bridge writes to a file (not a TTY) so its
         # stdout is block-buffered — without this its "[bridge] …" / "lowstate ->
         # PC" lines never reach the log in time and the readiness check times out
         # even when streaming is fine.
         inner = (
             f"export PYTHONUNBUFFERED=1; export CYCLONEDDS_HOME={cdds_home}; "
+            f"export SCL_PORT_OFFSET={port_offset}; "
             f"export LD_LIBRARY_PATH={cdds_home}/lib:${{LD_LIBRARY_PATH:-}}; "
             f"cd {a.bridge_dir} && exec {pyexe} -u dds_bridge_nx.py "
             f"--pc_ip {pc_ip} --iface {iface} --eef {a.eef}"

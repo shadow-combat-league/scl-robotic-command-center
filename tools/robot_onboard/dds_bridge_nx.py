@@ -49,8 +49,13 @@ from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
 # ---------------------------------------------------------------------------
 # UDP port assignments  (must match whole_body_teleop_record.py)
 # ---------------------------------------------------------------------------
-LOWSTATE_PORT   = 9501   # NX -> PC
-HAND_STATE_PORT = 9505   # NX -> PC
+# Per-robot PC-side offset: the PC runs one teleop per robot, each receiving on
+# its own port, so this bridge must send lowstate/hand to the matching offset
+# (same SCL_PORT_OFFSET the teleop uses). Command ports (9601+) are bound on THIS
+# NX, per-robot already, so they stay fixed.
+_PC_PORT_OFFSET = int(os.environ.get("SCL_PORT_OFFSET", "0"))
+LOWSTATE_PORT   = 9501 + _PC_PORT_OFFSET   # NX -> PC
+HAND_STATE_PORT = 9505 + _PC_PORT_OFFSET   # NX -> PC
 CMD_LATENT_PORT = 9601   # PC -> NX
 TELEOP_CMD_PORT = 9602   # PC -> NX
 LOCO_CMD_PORT   = 9603   # PC -> NX
