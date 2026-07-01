@@ -23,6 +23,8 @@ import {
   stopMotionPlayback,
   robotBridgeStart,
   robotBridgeStop,
+  startTeleopScript,
+  stopTeleopScript,
 } from "./tauri";
 import type {
   ActivityEvent,
@@ -414,24 +416,56 @@ class RobotService {
     return `http://127.0.0.1:${7000 + idx}/static/`;
   }
 
-  /** Launch the teleoperation script; the 3D (Meshcat) view appears once running. */
+  /**
+   * Launch the teleoperation pipeline for a robot. In the desktop app this
+   * starts the on-robot dds_bridge, then spawns whole_body_teleop_record_2.py
+   * (WBC env) which reads the paired headset via xrobotoolkit_sdk and streams to
+   * the robot; the Meshcat view appears once it's up. Browser stays mock.
+   */
   async startTeleop(id: string): Promise<void> {
     const s = this.teleopStateOf(id);
     if (s === "running" || s === "starting") return;
-    const name = this.robots.find((r) => r.id === id)?.name ?? "robot";
+    const r = this.robots.find((x) => x.id === id);
+    const name = r?.name ?? "robot";
     this.teleop[id] = "starting";
-    this.#log("info", `${name}: launching teleoperation script…`);
-    await wait(1600);
-    this.meshcatUrls[id] = this.#meshcatUrl(id);
-    this.teleop[id] = "running";
-    this.#log("success", `${name}: teleoperation running`);
+    this.#log("info", `${name}: launching teleoperation…`);
+    if (isTauri() && r) {
+      try {
+        await robotBridgeStart(r.ip, r.sshUser, r.sshPassword ?? "");
+        // The script picks a free Meshcat port (7000/7001/7002/…); use the URL
+        // it actually bound to rather than assuming a port.
+        const url = await startTeleopScript(id, r.ip, "inspire"); // eef default; per-robot config later
+        this.meshcatUrls[id] = url;
+        this.teleop[id] = "running";
+        this.#log("success", `${name}: teleoperation running`);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.teleop[id] = "error";
+        this.#log("error", `${name}: teleoperation failed — ${msg}`);
+      }
+    } else {
+      await wait(1600);
+      this.meshcatUrls[id] = this.#meshcatUrl(id);
+      this.teleop[id] = "running";
+      this.#log("success", `${name}: teleoperation running`);
+    }
   }
 
-  stopTeleop(id: string): void {
+  /** Stop teleop for a robot (returns it to FSM 801) + tears down the bridge. */
+  async stopTeleop(id: string): Promise<void> {
     if (this.teleopStateOf(id) === "stopped") return;
+    const r = this.robots.find((x) => x.id === id);
+    const name = r?.name ?? "robot";
     this.teleop[id] = "stopped";
     delete this.meshcatUrls[id];
-    const name = this.robots.find((r) => r.id === id)?.name ?? "robot";
+    if (isTauri() && r) {
+      try {
+        await stopTeleopScript(id); // SIGINT → script switches FSM 801 + settles
+        await robotBridgeStop(r.ip, r.sshUser, r.sshPassword ?? "");
+      } catch {
+        /* best-effort */
+      }
+    }
     this.#log("info", `${name}: teleoperation stopped`);
   }
 
@@ -471,6 +505,12 @@ class RobotService {
       if (this.teleopStateOf(r.id) !== "stopped") {
         this.teleop[r.id] = "stopped";
         delete this.meshcatUrls[r.id];
+        if (isTauri()) {
+          // An E-stop must actually kill the streaming teleop process + bridge,
+          // not just clear the UI (otherwise the robot keeps getting frames).
+          stopTeleopScript(r.id).catch(() => {});
+          robotBridgeStop(r.ip, r.sshUser, r.sshPassword ?? "").catch(() => {});
+        }
       }
     }
     this.#log("error", "ALL-STOP engaged — robots E-stopped, teleoperation halted");

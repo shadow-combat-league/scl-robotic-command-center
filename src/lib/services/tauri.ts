@@ -240,6 +240,20 @@ export function stopMotionPlayback(id: string): Promise<void> {
   return invoke("stop_motion_playback", { id });
 }
 
+// ---- live teleoperation (WBC whole_body_teleop_record_2.py) ----------------
+
+/** Start the live teleop pipeline for a robot — reads the paired headset via
+ *  xrobotoolkit_sdk, retargets, and streams to the robot over the UDP bridge.
+ *  Resolves to the Meshcat web URL the script actually bound to (dynamic port). */
+export function startTeleopScript(id: string, robotIp: string, eef: string): Promise<string> {
+  return invoke("start_teleop", { id, robotIp, eef });
+}
+
+/** Stop a robot's teleop pipeline (SIGINT → the script returns it to FSM 801). */
+export function stopTeleopScript(id: string): Promise<void> {
+  return invoke("stop_teleop", { id });
+}
+
 /** One line of live status from a robot's playback backend. */
 export interface PlaybackEvent {
   id: string;

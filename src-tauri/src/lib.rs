@@ -554,6 +554,151 @@ fn local_ipv4() -> String {
         .unwrap_or_default()
 }
 
+// ---- live teleoperation (whole_body_teleop_record_2.py, WBC env) ----------
+#[derive(Default)]
+struct TeleopState(Mutex<HashMap<String, Child>>);
+
+/// (python, wbc_dir) for the teleop pipeline. Invokes the EXISTING heavy WBC env
+/// (pinocchio/GMR/xrobotoolkit_sdk/inference) rather than bundling it. Override
+/// with SCL_TELEOP_PYTHON / SCL_TELEOP_DIR.
+fn resolve_teleop() -> Result<(String, String), String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let dir = std::env::var("SCL_TELEOP_DIR")
+        .unwrap_or_else(|_| format!("{home}/SCL/WBC_Pico_Record"));
+    let py = std::env::var("SCL_TELEOP_PYTHON")
+        .unwrap_or_else(|_| format!("{home}/miniconda3/envs/wbc_pico/bin/python"));
+    if !std::path::Path::new(&py).exists() {
+        return Err(format!("teleop python not found: {py} (set SCL_TELEOP_PYTHON)"));
+    }
+    if !std::path::Path::new(&dir)
+        .join("whole_body_teleop_record_2.py")
+        .exists()
+    {
+        return Err(format!(
+            "whole_body_teleop_record_2.py not found in {dir} (set SCL_TELEOP_DIR)"
+        ));
+    }
+    Ok((py, dir))
+}
+
+fn kill_teleop(state: &TeleopState, id: &str) {
+    if let Some(mut child) = state.0.lock().ok().and_then(|mut g| g.remove(id)) {
+        // SIGINT first so the script's KeyboardInterrupt path runs shutdown()
+        // (returns the robot to FSM 801), then force-kill as a fallback.
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .arg("-INT")
+                .arg(child.id().to_string())
+                .status();
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Read a teleop child stream: echo each line to the console and report the
+/// first Meshcat web URL it prints. The script lets meshcat pick a free port
+/// (7000, then 7001, 7002, … if taken), so the port is NOT fixed — we must use
+/// whatever it printed rather than assume 7000.
+fn spawn_teleop_reader<R: std::io::Read + Send + 'static>(stream: R, tx: mpsc::Sender<String>) {
+    std::thread::spawn(move || {
+        let mut sent = false;
+        for line in BufReader::new(stream).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if !sent {
+                if let Some(i) = line.find("http://") {
+                    let url = line[i..].split_whitespace().next().unwrap_or("");
+                    if url.contains("/static") {
+                        let _ = tx.send(url.to_string());
+                        sent = true;
+                    }
+                }
+            }
+            eprintln!("[teleop] {line}");
+        }
+    });
+}
+
+/// Start live teleop for a robot: the WBC script reads the paired headset via
+/// xrobotoolkit_sdk, retargets, and streams to the robot over the UDP bridge.
+/// Returns the Meshcat web URL the script actually bound to.
+#[tauri::command]
+fn start_teleop(
+    state: tauri::State<TeleopState>,
+    id: String,
+    robot_ip: String,
+    eef: String,
+) -> Result<String, String> {
+    kill_teleop(&state, &id);
+    // Sweep any ORPHAN teleop script still holding the fixed UDP ports (9501…)
+    // — e.g. left over from a `tauri dev` relaunch or crash, which the fresh
+    // process can't track — otherwise the new one fails to bind 9501. Run pkill
+    // directly (no shell) so it excludes its own PID; the new process below
+    // isn't spawned yet, so only orphans are killed. (One teleop at a time.)
+    #[cfg(unix)]
+    {
+        let _ = Command::new("pkill")
+            .arg("-9")
+            .arg("-f")
+            .arg("whole_body_teleop_record_2")
+            .status();
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    let (py, dir) = resolve_teleop()?;
+    let mut child = Command::new(&py)
+        .arg("whole_body_teleop_record_2.py")
+        .arg("--eef")
+        .arg(&eef)
+        .arg("--robot_ip")
+        .arg(&robot_ip)
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not start teleop ('{py}'): {e}"))?;
+
+    let (tx, rx) = mpsc::channel::<String>();
+    if let Some(out) = child.stdout.take() {
+        spawn_teleop_reader(out, tx.clone());
+    }
+    if let Some(err) = child.stderr.take() {
+        spawn_teleop_reader(err, tx.clone());
+    }
+    drop(tx);
+
+    // Wait for the Meshcat URL — the script inits GMR + the secure inferencer +
+    // the viewer first, which is slow. Disconnect/timeout => it never came up.
+    match rx.recv_timeout(Duration::from_secs(45)) {
+        Ok(url) => {
+            state.0.lock().unwrap().insert(id, child);
+            Ok(url)
+        }
+        Err(_) => {
+            let msg = match child.try_wait() {
+                Ok(Some(status)) => format!(
+                    "teleop exited before Meshcat came up ({status}) — check the WBC env and that a headset is streaming"
+                ),
+                _ => "teleop started but no Meshcat URL appeared within 45s".to_string(),
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(msg)
+        }
+    }
+}
+
+#[tauri::command]
+fn stop_teleop(state: tauri::State<TeleopState>, id: String) -> Result<(), String> {
+    kill_teleop(&state, &id);
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -562,6 +707,7 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .manage(PreviewState::default())
         .manage(PlaybackState::default())
+        .manage(TeleopState::default())
         .invoke_handler(tauri::generate_handler![
             start_motion_preview,
             stop_motion_preview,
@@ -572,7 +718,9 @@ pub fn run() {
             start_motion_playback,
             control_motion_playback,
             stop_motion_playback,
-            local_ipv4
+            local_ipv4,
+            start_teleop,
+            stop_teleop
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
